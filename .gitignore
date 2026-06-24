@@ -1,0 +1,20 @@
+# Local env configuration
+.env
+
+# Python compilation/cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# SQLite caches & databases
+cache/
+metrics/
+*.db
+
+# Verification Reports
+reports/
+
+# Logs
+logs/
+*.log

@@ -1,0 +1,4497 @@
+"""QADM CLI - Main entry point."""
+
+import getpass
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
+from . import __version__
+from .config import load_config
+from .db.connection import AS400ConnectionManager, ConnectionError
+from .db.schema import SchemaManager
+from .db.journal import JournalManager
+from .db.mssql import MSSQLConnection, MSSQLManager, MSSQLError
+from .models.connection import MSSQLConnection as MSSQLConnectionModel
+from .models.table import TableConfig
+from .utils.logger import setup_logging
+from .utils.formatters import print_table, print_json, print_json_clean, print_ascii_panel
+from .utils.db_types import SchemaConverter, DatabaseType
+
+console = Console()
+
+# Default config path
+DEFAULT_CONFIG = Path("config/connection.yaml")
+
+
+def _get_elevated_connection(
+    config: Any,
+    admin_user: str | None,
+    admin_password: str | None,
+    reason: str = "Elevated privileges required"
+) -> AS400ConnectionManager | None:
+    """Get an elevated connection using admin credentials.
+    
+    Prompts interactively if credentials not provided via command line.
+    Returns None if user cancels or credentials are invalid.
+    """
+    console.print(f"\n[cyan]Administrative credentials required: {reason}[/cyan]")
+    
+    # Use provided credentials or prompt interactively
+    if not admin_user:
+        admin_user = console.input("Admin user: ").strip()
+        if not admin_user:
+            return None
+    
+    if not admin_password:
+        # Try getpass first (for secure input), fallback to console.input
+        try:
+            admin_password = getpass.getpass("Admin password: ")
+        except (EOFError, OSError):
+            # Non-TTY environment (e.g., piped input), use console input
+            admin_password = console.input("Admin password (visible): ", password=True)
+        if not admin_password:
+            return None
+    
+    # Create temporary config with admin credentials
+    from .models.connection import ConnectionConfig, AS400Connection, DefaultsConfig
+    admin_as400_config = AS400Connection(
+        host=config.as400.host,
+        port=config.as400.port,
+        user=admin_user,
+        password=admin_password,
+        database=getattr(config.as400, 'database', '*LOCAL'),
+        ssl=getattr(config.as400, 'ssl', True)
+    )
+    # Wrap in full ConnectionConfig
+    admin_config = ConnectionConfig(
+        as400=admin_as400_config,
+        defaults=getattr(config, 'defaults', DefaultsConfig())
+    )
+    
+    try:
+        # Create and test the elevated connection
+        admin_conn = AS400ConnectionManager(admin_config)
+        admin_conn.connect()
+        console.print(f"[green]Connected as {admin_user} with elevated privileges[/green]\n")
+        return admin_conn
+    except Exception as e:
+        console.print(f"[red]Failed to connect as {admin_user}: {e}[/red]")
+        return None
+
+
+def print_panel(
+    ctx: click.Context,
+    content: str | Text,
+    title: str | None = None,
+    border_style: str = "blue"
+) -> None:
+    """Print content in a panel with border style from context.
+    
+    Uses unicode (Rich Panel) or ascii (print_ascii_panel) based on
+    the --border-style CLI option.
+    """
+    border_style_opt = ctx.obj.get("border_style", "unicode")
+    
+    if border_style_opt == "ascii":
+        print_ascii_panel(console, content, title=title, border_style=border_style)
+    else:
+        console.print(Panel(content, title=title, border_style=border_style))
+
+
+def get_config_path(ctx: click.Context, param: Any, value: str | None) -> Path:
+    """Resolve config path."""
+    if value:
+        path = Path(value)
+    else:
+        # Try environment variable first
+        env_config = os.environ.get("QADMCLI_CONFIG")
+        if env_config:
+            path = Path(env_config)
+        else:
+            path = DEFAULT_CONFIG
+    
+    if not path.exists():
+        raise click.BadParameter(f"Config file not found: {path}")
+    
+    return path
+
+
+@click.group()
+@click.version_option(version=__version__, prog_name="qadmcli")
+@click.option(
+    "--config", "-c",
+    type=click.Path(exists=True, path_type=Path),
+    callback=get_config_path,
+    help="Path to connection config file (default: config/connection.yaml)"
+)
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+@click.option(
+    "--border-style", "-b",
+    type=click.Choice(["unicode", "ascii"], case_sensitive=False),
+    default="unicode",
+    help="Border style for panels: unicode (default) or ascii (for Windows/PowerShell)"
+)
+@click.pass_context
+def cli(ctx: click.Context, config: Path, verbose: bool, border_style: str) -> None:
+    """QADM CLI - AS400 DB2 for i Database Management Tool."""
+    # Ensure context object exists
+    ctx.ensure_object(dict)
+    
+    # Store options in context
+    ctx.obj["config_path"] = config
+    ctx.obj["verbose"] = verbose
+    ctx.obj["border_style"] = border_style.lower()
+    
+    # Setup logging
+    log_level = "DEBUG" if verbose else "INFO"
+    setup_logging(log_level)
+
+
+@cli.group()
+def connection() -> None:
+    """Connection management commands."""
+    pass
+
+
+@connection.command("test")
+@click.option("-U", "--username", help="Test connection with specific username (admin user)")
+@click.option("-P", "--password", help="Password for the specified username")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def connection_test(ctx: click.Context, username: str | None, password: str | None, output_format: str) -> None:
+    """Test connection to AS400.
+    
+    Examples:
+        qadmcli connection test                  # Test with default user from config
+        qadmcli connection test -U QSECOFR       # Test with admin user (prompts for password)
+        qadmcli connection test -U QSECOFR -P pass  # Test with admin user and password
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        # Override credentials if provided
+        if username:
+            if not password:
+                import getpass
+                password = getpass.getpass(f"Password for {username}: ")
+            
+            console.print(f"[dim]Testing connection as user: {username}[/dim]")
+            
+            # Create temporary config with override credentials
+            from .models.connection import AS400Connection
+            test_as400 = AS400Connection(
+                host=config.as400.host,
+                user=username,
+                password=password,
+                port=config.as400.port,
+                ssl=config.as400.ssl,
+                database=config.as400.database,
+            )
+            config.as400 = test_as400
+        
+        with AS400ConnectionManager(config) as conn:
+            info = conn.test_connection()
+        
+        if output_format == "json":
+            print_json_clean(info)
+        else:
+            print_panel(
+                ctx,
+                Text.assemble(
+                    ("Host: ", "bold"), info["host"], "\n",
+                    ("User: ", "bold"), info.get("user", "N/A"), "\n",
+                    ("Status: ", "bold"), ("Connected", "green"), "\n",
+                    ("Version: ", "bold"), info["server_info"].get("version", "N/A"),
+                ),
+                title="Connection Test",
+                border_style="green"
+            )
+        
+    except ConnectionError as e:
+        print_panel(
+            ctx,
+            Text.assemble(("Error: ", "bold red"), e.message),
+            title="Connection Failed",
+            border_style="red"
+        )
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+def table() -> None:
+    """Table management commands."""
+    pass
+
+
+@table.command("check")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library/schema name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def table_check(ctx: click.Context, table: str, library: str, output_format: str) -> None:
+    """Check if table exists and show info."""
+    import logging
+    logger = logging.getLogger("qadmcli")
+    
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output
+    if output_format == "json":
+        logger.setLevel(logging.WARNING)
+    
+    try:
+        logger.debug(f"Loading config from: {config_path}")
+        config = load_config(config_path)
+        logger.debug(f"Config loaded. Host: {config.as400.host}, Library: {config.defaults.library}")
+        
+        with AS400ConnectionManager(config) as conn:
+            logger.debug("Connected to AS400, creating SchemaManager")
+            schema = SchemaManager(conn)
+            
+            logger.debug(f"Checking if table {library}.{table} exists")
+            exists = schema.table_exists(table, library)
+            logger.debug(f"Table exists: {exists}")
+            
+            if exists:
+                logger.debug(f"Getting table info for {library}.{table}")
+                info = schema.get_table_info(table, library)
+                row_count = schema.get_table_row_count(table, library) if info else None
+                columns = schema.get_columns(table, library) if info else []
+                pk_columns = schema.get_primary_key(table, library)
+                logger.debug(f"Table info retrieved successfully")
+                if output_format == "json":
+                    data = info.model_dump() if info else {}
+                    data["row_count"] = row_count
+                    data["columns"] = columns
+                    data["primary_key"] = pk_columns
+                    print_json_clean(data)
+                else:
+                    # Build text parts safely
+                    # Use actual system name from info, not the input name
+                    system_name = info.name if info else table
+                    sql_name = info.sql_name if info else None
+                    
+                    parts = [
+                        ("Table: ", "bold"), f"{library}.{table}", "\n",
+                        ("System Name: ", "bold"), system_name, "\n",
+                    ]
+                    if sql_name and sql_name != system_name:
+                        parts.extend([("SQL Name: ", "bold"), sql_name, "\n"])
+                    parts.extend([
+                        ("Exists: ", "bold"), ("Yes", "green"), "\n",
+                        ("Row Count: ", "bold"), f"{row_count:,}" if row_count is not None else "N/A", "\n",
+                        ("Journaled: ", "bold"), 
+                    ])
+                    if info and info.journaled:
+                        parts.extend([("Yes", "green"), "\n"])
+                        if info.journal_library and info.journal_name:
+                            parts.extend([("Journal: ", "bold"), f"{info.journal_library}.{info.journal_name}", "\n"])
+                    else:
+                        parts.extend([("No", "yellow"), "\n"])
+                    
+                    # Add primary key info with identity indicator
+                    if pk_columns:
+                        pk_parts = []
+                        for pk_col in pk_columns:
+                            # Find column to check if it's identity
+                            is_identity = False
+                            for c in columns:
+                                if c["name"] == pk_col and (c.get("is_identity") or c.get("is_generated")):
+                                    is_identity = True
+                                    break
+                            if is_identity:
+                                pk_parts.append(f"{pk_col} (auto)")
+                            else:
+                                pk_parts.append(pk_col)
+                        parts.extend([("Primary Key: ", "bold"), ", ".join(pk_parts), "\n"])
+                    else:
+                        parts.extend([("Primary Key: ", "bold"), ("None", "yellow"), "\n"])
+                    
+                    print_panel(
+                        ctx,
+                        Text.assemble(*parts),
+                        title="Table Information",
+                        border_style="green"
+                    )
+                    
+                    # Show columns with PK indicator, identity status, and mockup pattern
+                    if columns:
+                        from .utils.data_generator import DataGenerator
+                        dg = DataGenerator()
+                        
+                        # Use ASCII indicators when border style is ASCII
+                        border_style = ctx.obj.get("border_style", "unicode")
+                        if border_style == "ascii":
+                            pk_indicator_char = "[PK]"
+                            identity_indicator_char = "[ID]"
+                        else:
+                            pk_indicator_char = "🔑"
+                            identity_indicator_char = "⚡"
+                        
+                        col_rows = []
+                        for c in columns:
+                            pk_indicator = pk_indicator_char if c["name"] in pk_columns else ""
+                            identity_indicator = identity_indicator_char if c.get("is_identity") or c.get("is_generated") else ""
+                            pattern = dg.detect_pattern(c["name"], c["type"], c.get("hint"))
+                            
+                            # Format CCSID display
+                            ccsid_val = c.get("ccsid")
+                            if ccsid_val is not None:
+                                if ccsid_val == 65535:
+                                    ccsid_display = "65535 (Binary)"
+                                elif ccsid_val == 838:
+                                    ccsid_display = "838 (Thai)"
+                                elif ccsid_val == 1208:
+                                    ccsid_display = "1208 (UTF-8)"
+                                elif ccsid_val == 37:
+                                    ccsid_display = "37 (English)"
+                                else:
+                                    ccsid_display = str(ccsid_val)
+                            else:
+                                ccsid_display = ""
+                            
+                            col_rows.append([
+                                f"{c['name']} {pk_indicator}{identity_indicator}".strip(),
+                                c["type"],
+                                str(c["length"]) if c["length"] else "",
+                                "Yes" if c["nullable"] else "No",
+                                "Auto" if c.get("is_identity") or c.get("is_generated") else "",
+                                ccsid_display,
+                                pattern
+                            ])
+                        console.print(print_table(
+                            console,
+                            ["Column", "Type", "Length", "Nullable", "Identity", "CCSID", "Mockup Pattern"],
+                            col_rows,
+                            title=f"Columns in {library}.{table}"
+                        ))
+            else:
+                if output_format == "json":
+                    print_json_clean({"exists": False, "table": f"{library}.{table}"})
+                else:
+                    console.print(f"[yellow]Table {library}.{table} does not exist.[/yellow]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("create")
+@click.option("--table", "-t", help="Table name (if not using schema file)")
+@click.option("--library", "-l", help="Library name (if not using schema file)")
+@click.option("--schema", "-s", type=click.Path(exists=True), help="Schema YAML or SQL file")
+@click.option("--dry-run", is_flag=True, help="Show SQL without executing")
+@click.pass_context
+def table_create(ctx: click.Context, table: str | None, library: str | None, schema: str | None, dry_run: bool) -> None:
+    """Create a table from schema definition."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            schema_mgr = SchemaManager(conn)
+            
+            if schema:
+                schema_path = Path(schema)
+                if schema_path.suffix == ".sql":
+                    # Execute SQL file
+                    executed = schema_mgr.execute_sql_file(str(schema_path), dry_run)
+                    if dry_run:
+                        console.print(f"[blue]Would execute {len(executed)} statements[/blue]")
+                    else:
+                        console.print(f"[green]Executed {len(executed)} statements[/green]")
+                else:
+                    # YAML schema
+                    table_config = TableConfig.from_yaml(str(schema_path))
+                    ddl = schema_mgr.create_table(table_config, dry_run)
+                    if dry_run:
+                        print_panel(ctx, ddl, title="SQL to Execute", border_style="blue")
+                    else:
+                        console.print(f"[green]Created table {table_config.library}.{table_config.name}[/green]")
+            else:
+                if not name or not library:
+                    console.print("[red]Error: --name and --library required when not using --schema[/red]")
+                    sys.exit(1)
+                
+                if schema_mgr.table_exists(table, library):
+                    console.print(f"[yellow]Table {library}.{table} already exists.[/yellow]")
+                    sys.exit(0)
+                
+                # Would need column definitions for simple create
+                console.print("[red]Error: Use --schema for new table creation[/red]")
+                sys.exit(1)
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("drop-create")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--schema", "-s", type=click.Path(exists=True), required=True, help="Schema YAML or SQL file")
+@click.option("--force", "-f", is_flag=True, help="Force drop if table exists")
+@click.option("--dry-run", is_flag=True, help="Show SQL without executing")
+@click.pass_context
+def table_drop_create(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    schema: str,
+    force: bool,
+    dry_run: bool
+) -> None:
+    """Drop and recreate a table."""
+    config_path = ctx.obj["config_path"]
+    
+    if not force and not dry_run:
+        console.print("[red]Error: Use --force to confirm drop and recreate[/red]")
+        sys.exit(1)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            schema_mgr = SchemaManager(conn)
+            
+            schema_path = Path(schema)
+            if schema_path.suffix == ".sql":
+                # Drop first
+                if schema_mgr.table_exists(table, library):
+                    if dry_run:
+                        console.print(f"[blue]Would drop table {library}.{table}[/blue]")
+                    else:
+                        schema_mgr.drop_table(table, library)
+                        console.print(f"[yellow]Dropped table {library}.{table}[/yellow]")
+                
+                # Execute SQL file
+                executed = schema_mgr.execute_sql_file(str(schema_path), dry_run)
+                if dry_run:
+                    console.print(f"[blue]Would execute {len(executed)} statements[/blue]")
+                else:
+                    console.print(f"[green]Recreated table {library}.{table}[/green]")
+            else:
+                # YAML schema
+                table_config = TableConfig.from_yaml(str(schema_path))
+                ddl = schema_mgr.drop_create_table(table_config, force=True, dry_run=dry_run)
+                if dry_run:
+                    print_panel(ctx, ddl, title="SQL to Execute", border_style="blue")
+                else:
+                    console.print(f"[green]Recreated table {library}.{table}[/green]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("list")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--type", "table_type", help="Filter by table type (TABLE, VIEW, etc.)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def table_list(ctx: click.Context, library: str, table_type: str | None, output_format: str) -> None:
+    """List tables in a library."""
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output
+    if output_format == "json":
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            schema = SchemaManager(conn)
+            tables = schema.list_tables(library, table_type)
+            
+            if output_format == "json":
+                print_json_clean([t.model_dump() for t in tables])
+            else:
+                if tables:
+                    rows = []
+                    for t in tables:
+                        journal_info = f"{t.journal_library}.{t.journal_name}" if t.journal_library and t.journal_name else "No"
+                        # Show both system name and SQL name if different
+                        name_display = t.name
+                        if t.sql_name and t.sql_name != t.name:
+                            name_display = f"{t.name} ({t.sql_name})"
+                        rows.append([name_display, t.table_type, "Yes" if t.journaled else "No", journal_info])
+                    console.print(print_table(
+                        console,
+                        ["Table Name (System / SQL)", "Type", "Journaled", "Journal"],
+                        rows,
+                        title=f"Tables in {library}"
+                    ))
+                else:
+                    console.print(f"[yellow]No tables found in {library}[/yellow]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("drop")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--cascade", "-c", is_flag=True, help="Cascade drop (remove constraints)")
+@click.option("--force", "-f", is_flag=True, help="Force drop without confirmation")
+@click.pass_context
+def table_drop(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    cascade: bool,
+    force: bool
+) -> None:
+    """Drop a table."""
+    config_path = ctx.obj["config_path"]
+    
+    if not force:
+        console.print(f"[yellow]Warning: This will permanently delete table {library}.{table}[/yellow]")
+        console.print("Use --force to confirm.")
+        sys.exit(1)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            schema = SchemaManager(conn)
+            
+            if not schema.table_exists(table, library):
+                console.print(f"[yellow]Table {library}.{table} does not exist.[/yellow]")
+                sys.exit(0)
+            
+            schema.drop_table(table, library, cascade)
+            console.print(f"[green]Dropped table {library}.{table}[/green]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("empty")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--force", "-f", is_flag=True, help="Force delete without confirmation")
+@click.pass_context
+def table_empty(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    force: bool
+) -> None:
+    """Delete all data from a table (TRUNCATE)."""
+    config_path = ctx.obj["config_path"]
+    
+    if not force:
+        console.print(f"[yellow]Warning: This will delete ALL data from {library}.{table}[/yellow]")
+        console.print("Use --force to confirm.")
+        sys.exit(1)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            schema = SchemaManager(conn)
+            
+            if not schema.table_exists(table, library):
+                console.print(f"[yellow]Table {library}.{table} does not exist.[/yellow]")
+                sys.exit(1)
+            
+            # Get row count before truncate
+            row_count = schema.get_table_row_count(table, library)
+            
+            # Execute TRUNCATE
+            sql = f"DELETE FROM {library}.{table}"
+            cursor = conn.execute(sql)
+            cursor.close()
+            conn.commit()
+            
+            console.print(f"[green]Deleted all data from {library}.{table}[/green]")
+            console.print(f"Rows removed: {row_count:,}" if row_count else "Rows removed: Unknown")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("reverse")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--output", "-o", type=click.Path(), help="Output YAML file path")
+@click.pass_context
+def table_reverse(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    output: str | None
+) -> None:
+    """Generate YAML schema from existing table."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            schema = SchemaManager(conn)
+            
+            if not schema.table_exists(table, library):
+                console.print(f"[red]Table {library}.{table} does not exist.[/red]")
+                sys.exit(1)
+            
+            # Generate YAML from table
+            yaml_content = schema.generate_yaml_from_table(name, library)
+            
+            if output:
+                with open(output, "w", encoding="utf-8") as f:
+                    f.write(yaml_content)
+                console.print(f"[green]Schema saved to {output}[/green]")
+            else:
+                print_panel(ctx, yaml_content, title=f"Schema for {library}.{table}", border_style="blue")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("convert")
+@click.option("--schema", "-s", required=True, type=click.Path(exists=True), help="Source schema YAML file")
+@click.option("--source-db", "-db", required=True, type=click.Choice(["DB2", "MSSQL"]), help="Source database type")
+@click.option("--target-db", "-tdb", required=True, type=click.Choice(["DB2", "MSSQL"]), help="Target database type")
+@click.option("--output", "-o", type=click.Path(), help="Output file for converted schema")
+@click.pass_context
+def table_convert(
+    ctx: click.Context,
+    schema: str,
+    source_db: str,
+    target_db: str,
+    output: str | None
+) -> None:
+    """Convert table schema between database types."""
+    try:
+        import yaml
+
+        # Load source schema
+        with open(schema, "r", encoding="utf-8") as f:
+            schema_data = yaml.safe_load(f)
+
+        # Convert schema
+        converter = SchemaConverter(source_db, target_db)
+        converted_columns = converter.convert_schema(schema_data.get("columns", []))
+
+        # Extract table info - support both nested (table.name) and flat (table_name) formats
+        table_info = schema_data.get("table", {})
+        table_name = schema_data.get("table_name") or table_info.get("name")
+        library = schema_data.get("library") or table_info.get("library")
+        
+        # Build output schema
+        output_schema = {
+            "table_name": table_name,
+            "library": library,
+            "description": f"Converted from {source_db} to {target_db}",
+            "columns": converted_columns,
+        }
+
+        # Add primary key if exists (support both formats)
+        constraints = schema_data.get("constraints", {})
+        primary_key = schema_data.get("primary_key") or constraints.get("primary_key")
+        if primary_key:
+            # Normalize to list format
+            if isinstance(primary_key, dict) and "columns" in primary_key:
+                output_schema["primary_key"] = primary_key["columns"]
+            elif isinstance(primary_key, list):
+                output_schema["primary_key"] = primary_key
+            else:
+                output_schema["primary_key"] = [primary_key]
+
+        yaml_output = yaml.dump(output_schema, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+        if output:
+            with open(output, "w", encoding="utf-8") as f:
+                f.write(yaml_output)
+            console.print(f"[green]Converted schema saved to {output}[/green]")
+        else:
+            print_panel(ctx, yaml_output, title=f"Converted Schema ({source_db} -> {target_db})", border_style="blue")
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("create-mssql")
+@click.option("--name", "-n", required=True, help="Table name")
+@click.option("--schema", "-s", required=True, type=click.Path(exists=True), help="Schema YAML file")
+@click.option("--mssql-config", "-mc", type=click.Path(exists=True), help="MSSQL connection config (defaults to connection.yaml)")
+@click.option("--database", "-d", required=True, help="MSSQL database name")
+@click.option("--schema-name", "-sn", default="dbo", help="MSSQL schema name (default: dbo)")
+@click.option("--drop-if-exists", is_flag=True, help="Drop table if exists")
+@click.option("--dry-run", is_flag=True, help="Preview SQL without executing")
+@click.pass_context
+def table_create_mssql(
+    ctx: click.Context,
+    name: str,
+    schema: str,
+    mssql_config: str | None,
+    database: str,
+    schema_name: str,
+    drop_if_exists: bool,
+    dry_run: bool
+) -> None:
+    """Create table on MSSQL from schema file."""
+    config_path = mssql_config or ctx.obj["config_path"]
+
+    try:
+        import yaml
+        from .models.connection import ConnectionConfig
+
+        # Load table schema
+        with open(schema, "r", encoding="utf-8") as f:
+            schema_data = yaml.safe_load(f)
+
+        # Load MSSQL connection config
+        config = load_config(Path(config_path))
+        
+        # Check if MSSQL is configured
+        if not config.mssql:
+            console.print("[red]Error: MSSQL connection not configured.[/red]")
+            console.print("[yellow]Please set MSSQL_USER and MSSQL_PASSWORD environment variables[/yellow]")
+            console.print("[yellow]or provide a custom config file with --mssql-config[/yellow]")
+            sys.exit(1)
+        
+        # Create MSSQL connection config (only MSSQL part needed)
+        mssql_conn_cfg = MSSQLConnectionModel(
+            host=config.mssql.host,
+            port=config.mssql.port,
+            username=config.mssql.username,
+            password=config.mssql.password,
+            database=database,
+        )
+
+        # Convert schema if source is DB2
+        columns = schema_data.get("columns", [])
+        if schema_data.get("source_db", "DB2").upper() == "DB2":
+            converter = SchemaConverter("DB2", "MSSQL")
+            columns = converter.convert_schema(columns)
+
+        if dry_run:
+            # Preview SQL
+            preview_conn = MSSQLConnection(mssql_conn_cfg)
+            preview_mgr = MSSQLManager(preview_conn)
+            sql_preview = preview_mgr.schema._build_create_sql(name, columns, schema_name, schema_data.get("primary_key"))
+            # Use Text to preserve SQL brackets (avoid Rich markup interpretation)
+            sql_text = Text(sql_preview, style="cyan")
+            print_panel(ctx, sql_text, title="Preview SQL", border_style="yellow")
+            return
+
+        # Create table
+        with MSSQLConnection(mssql_conn_cfg) as conn:
+            mgr = MSSQLManager(conn)
+            mgr.schema.create_table(
+                table_name=name,
+                columns=columns,
+                schema=schema_name,
+                primary_key=schema_data.get("primary_key"),
+                drop_if_exists=drop_if_exists
+            )
+            success_text = Text.assemble(
+                ("Table [", "green"),
+                (f"{schema_name}.{name}", "bold cyan"),
+                ("] created successfully", "green")
+            )
+            console.print(success_text)
+
+    except MSSQLError as e:
+        console.print(f"[red]MSSQL Error: {e}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@table.command("compare-schemas")
+@click.option("--db2-table", "-d2", required=True, help="DB2 table name (LIBRARY.TABLE)")
+@click.option("--mssql-table", "-ms", required=True, help="MSSQL table name (SCHEMA.TABLE)")
+@click.option("--mssql-config", "-mc", type=click.Path(exists=True), help="MSSQL connection config")
+@click.pass_context
+def table_compare_schemas(
+    ctx: click.Context,
+    db2_table: str,
+    mssql_table: str,
+    mssql_config: str | None
+) -> None:
+    """Compare schemas between DB2 for i and MSSQL tables."""
+    config_path = ctx.obj["config_path"]
+
+    try:
+        # Parse table names
+        db2_parts = db2_table.split(".")
+        if len(db2_parts) != 2:
+            console.print("[red]DB2 table must be in format: LIBRARY.TABLE[/red]")
+            sys.exit(1)
+        db2_library, db2_name = db2_parts
+
+        mssql_parts = mssql_table.split(".")
+        if len(mssql_parts) != 2:
+            console.print("[red]MSSQL table must be in format: SCHEMA.TABLE[/red]")
+            sys.exit(1)
+        mssql_schema, mssql_name = mssql_parts
+
+        # Load configs
+        config = load_config(config_path)
+
+        # Get DB2 schema
+        with AS400ConnectionManager(config) as conn:
+            schema_mgr = SchemaManager(conn)
+            db2_columns = schema_mgr.get_columns(db2_name, db2_library)
+
+        # Get MSSQL schema
+        mssql_cfg = load_config(Path(mssql_config) if mssql_config else config_path)
+        
+        # Check if MSSQL is configured
+        if not mssql_cfg.mssql:
+            console.print("[red]Error: MSSQL connection not configured.[/red]")
+            console.print("[yellow]Please set MSSQL_USER and MSSQL_PASSWORD environment variables[/yellow]")
+            console.print("[yellow]or provide a custom config file with --mssql-config[/yellow]")
+            sys.exit(1)
+        
+        mssql_conn_cfg = MSSQLConnectionModel(
+            host=mssql_cfg.mssql.host,
+            port=mssql_cfg.mssql.port,
+            username=mssql_cfg.mssql.username,
+            password=mssql_cfg.mssql.password,
+            database=mssql_cfg.mssql.database,
+        )
+
+        with MSSQLConnection(mssql_conn_cfg) as conn:
+            mssql_mgr = MSSQLManager(conn)
+            mssql_columns = mssql_mgr.schema.get_columns(mssql_name, mssql_schema)
+
+        # Compare schemas with fuzzy matching
+        converter = SchemaConverter("DB2", "MSSQL")
+        mismatches = []
+        side_by_side = []
+
+        # Build fuzzy matching key (remove underscores, normalize)
+        def normalize_key(name: str) -> str:
+            """Normalize column name for fuzzy matching."""
+            return name.upper().replace("_", "").replace(" ", "")
+        
+        # Create maps
+        db2_col_map = {col["name"].upper(): col for col in db2_columns}
+        mssql_col_map = {col["name"].upper(): col for col in mssql_columns}
+        db2_fuzzy_map = {normalize_key(col["name"]): col for col in db2_columns}
+        mssql_fuzzy_map = {normalize_key(col["name"]): col for col in mssql_columns}
+        
+        # Track processed columns
+        db2_processed = set()
+        mssql_processed = set()
+        
+        # First pass: exact matches
+        for col_name_upper in sorted(db2_col_map.keys() & mssql_col_map.keys()):
+            db2_col = db2_col_map[col_name_upper]
+            mssql_col = mssql_col_map[col_name_upper]
+            db2_processed.add(col_name_upper)
+            mssql_processed.add(col_name_upper)
+            
+            db2_type = DatabaseType(
+                db_type=db2_col["type"],
+                length=db2_col.get("length"),
+                scale=db2_col.get("scale"),
+                nullable=db2_col.get("nullable", True)
+            )
+            expected_mssql = converter.convert_column(db2_col["name"], db2_type)
+            
+            type_match = expected_mssql.db_type == mssql_col["type"]
+            null_match = db2_col.get("nullable", True) == mssql_col.get("nullable", True)
+            
+            db2_type_str = f"{db2_col['type']}"
+            if db2_col.get('length'):
+                db2_type_str += f"({db2_col['length']}"
+                if db2_col.get('scale'):
+                    db2_type_str += f",{db2_col['scale']}"
+                db2_type_str += ")"
+            
+            mssql_type_str = f"{mssql_col['type']}"
+            if mssql_col.get('length'):
+                mssql_type_str += f"({mssql_col['length']}"
+                if mssql_col.get('scale'):
+                    mssql_type_str += f",{mssql_col['scale']}"
+                mssql_type_str += ")"
+            
+            if type_match and null_match:
+                status = "[green]OK Match[/green]"
+            else:
+                status_parts = []
+                if not type_match:
+                    status_parts.append(f"Type: {expected_mssql.db_type}≠{mssql_col['type']}")
+                    mismatches.append(
+                        f"Column '{db2_col['name']}' type mismatch: DB2({db2_col['type']}) -> "
+                        f"Expected MSSQL({expected_mssql.db_type}), Got MSSQL({mssql_col['type']})"
+                    )
+                if not null_match:
+                    status_parts.append("Null mismatch")
+                    mismatches.append(
+                        f"Column '{db2_col['name']}' nullable mismatch: DB2({db2_col.get('nullable')}) vs "
+                        f"MSSQL({mssql_col.get('nullable')})"
+                    )
+                status = f"[red]{' | '.join(status_parts)}[/red]"
+            
+            side_by_side.append({
+                "column": db2_col["name"],
+                "db2_type": db2_type_str,
+                "db2_null": "Y" if db2_col.get('nullable') else "N",
+                "mssql_type": mssql_type_str,
+                "mssql_null": "Y" if mssql_col.get('nullable') else "N",
+                "status": status
+            })
+        
+        # Second pass: fuzzy matches (columns that normalize to same key)
+        for db2_col in db2_columns:
+            db2_name_upper = db2_col["name"].upper()
+            if db2_name_upper in db2_processed:
+                continue
+            
+            fuzzy_key = normalize_key(db2_col["name"])
+            mssql_col = mssql_fuzzy_map.get(fuzzy_key)
+            
+            if mssql_col and mssql_col["name"].upper() not in mssql_processed:
+                mssql_name_upper = mssql_col["name"].upper()
+                db2_processed.add(db2_name_upper)
+                mssql_processed.add(mssql_name_upper)
+                
+                db2_type = DatabaseType(
+                    db_type=db2_col["type"],
+                    length=db2_col.get("length"),
+                    scale=db2_col.get("scale"),
+                    nullable=db2_col.get("nullable", True)
+                )
+                expected_mssql = converter.convert_column(db2_col["name"], db2_type)
+                
+                type_match = expected_mssql.db_type == mssql_col["type"]
+                null_match = db2_col.get("nullable", True) == mssql_col.get("nullable", True)
+                
+                db2_type_str = f"{db2_col['type']}"
+                if db2_col.get('length'):
+                    db2_type_str += f"({db2_col['length']}"
+                    if db2_col.get('scale'):
+                        db2_type_str += f",{db2_col['scale']}"
+                    db2_type_str += ")"
+                
+                mssql_type_str = f"{mssql_col['type']}"
+                if mssql_col.get('length'):
+                    mssql_type_str += f"({mssql_col['length']}"
+                    if mssql_col.get('scale'):
+                        mssql_type_str += f",{mssql_col['scale']}"
+                    mssql_type_str += ")"
+                
+                if type_match and null_match:
+                    status = "[yellow]~ Fuzzy Match[/yellow]"
+                else:
+                    status_parts = []
+                    if not type_match:
+                        status_parts.append(f"Type: {expected_mssql.db_type}≠{mssql_col['type']}")
+                        mismatches.append(
+                            f"Fuzzy column '{db2_col['name']}↔{mssql_col['name']}' type mismatch"
+                        )
+                    if not null_match:
+                        status_parts.append("Null mismatch")
+                        mismatches.append(
+                            f"Fuzzy column '{db2_col['name']}↔{mssql_col['name']}' nullable mismatch"
+                        )
+                    status = f"[red]{' | '.join(status_parts)}[/red]"
+                
+                side_by_side.append({
+                    "column": f"{db2_col['name']}↔{mssql_col['name']}",
+                    "db2_type": db2_type_str,
+                    "db2_null": "Y" if db2_col.get('nullable') else "N",
+                    "mssql_type": mssql_type_str,
+                    "mssql_null": "Y" if mssql_col.get('nullable') else "N",
+                    "status": status
+                })
+        
+        # Third pass: unmatched columns
+        for db2_col in db2_columns:
+            if db2_col["name"].upper() not in db2_processed:
+                side_by_side.append({
+                    "column": db2_col["name"],
+                    "db2_type": f"[cyan]{db2_col['type']}[/cyan]",
+                    "db2_null": "Y" if db2_col.get('nullable') else "N",
+                    "mssql_type": "[red]N/A[/red]",
+                    "mssql_null": "",
+                    "status": "[red]DB2 Only[/red]"
+                })
+                mismatches.append(f"Column '{db2_col['name']}' exists in DB2 but not in MSSQL")
+        
+        for mssql_col in mssql_columns:
+            if mssql_col["name"].upper() not in mssql_processed:
+                side_by_side.append({
+                    "column": mssql_col["name"],
+                    "db2_type": "[red]N/A[/red]",
+                    "db2_null": "",
+                    "mssql_type": f"[cyan]{mssql_col['type']}[/cyan]",
+                    "mssql_null": "Y" if mssql_col.get('nullable') else "N",
+                    "status": "[red]MSSQL Only[/red]"
+                })
+                mismatches.append(f"Column '{mssql_col['name']}' exists in MSSQL but not in DB2")
+
+        # Display side-by-side table
+        from rich.table import Table
+        from rich import box
+        table = Table(title=f"Schema Comparison: {db2_table} vs {mssql_table}", box=box.ASCII)
+        table.add_column("Column", style="bold")
+        table.add_column("DB2 Type", justify="left")
+        table.add_column("N", justify="center")
+        table.add_column("MSSQL Type", justify="left")
+        table.add_column("N", justify="center")
+        table.add_column("Status", justify="left")
+        
+        for row in side_by_side:
+            table.add_row(
+                row["column"],
+                row["db2_type"],
+                row["db2_null"],
+                row["mssql_type"],
+                row["mssql_null"],
+                row["status"]
+            )
+        
+        console.print(table)
+        
+        # Summary
+        total_columns = len(db2_columns) + len(mssql_columns) - len([r for r in side_by_side if "Match" in r["status"]])
+        if mismatches:
+            console.print(f"\n[red]Found {len(mismatches)} difference(s)[/red]")
+        else:
+            console.print(f"\n[green]✓ Schemas match! {len(side_by_side)} column pair(s) are compatible.[/green]")
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+def journal() -> None:
+    """Journal management commands."""
+    pass
+
+
+@journal.command("check")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_check(ctx: click.Context, table: str, library: str, output_format: str) -> None:
+    """Check journal status for a table."""
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output
+    if output_format == "json":
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            info = jrn.get_journal_info(table, library)
+            
+            if output_format == "json":
+                print_json_clean(info.get_summary())
+            else:
+                status_color = "green" if info.is_journaled else "yellow"
+                print_panel(
+                    ctx,
+                    Text.assemble(
+                        ("Table: ", "bold"), f"{library}.{table}", "\n",
+                        ("Journaled: ", "bold"), ("Yes" if info.is_journaled else "No", status_color), "\n",
+                        ("Journal: ", "bold"), (f"{info.journal_library}.{info.journal_name}" if info.journal_library and info.journal_name else "N/A"), "\n",
+                        ("Receiver: ", "bold"), (f"{info.journal_receiver_library}.{info.journal_receiver_name}" if info.journal_receiver_library and info.journal_receiver_name else "N/A"), "\n",
+                        ("Entry Range: ", "bold"), 
+                        (f"{info.oldest_entry_sequence} - {info.newest_entry_sequence}" if info.oldest_entry_sequence and info.newest_entry_sequence else "N/A"),
+                    ),
+                    title="Journal Information",
+                    border_style=status_color
+                )
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("disable")
+@click.option("--table", "-t", required=True, help="Table name (supports wildcards: * or %)")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--dry-run", is_flag=True, help="Show which tables would be affected without making changes")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_disable(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    dry_run: bool,
+    output_format: str
+) -> None:
+    """Disable journaling for one or more tables.
+    
+    Supports wildcards:
+      - * or % for multiple characters
+      - ? or _ for single character
+    
+    Examples:
+      qadmcli journal disable -t TB_01 -l EZPIPE
+      qadmcli journal disable -t "TB_*" -l EZPIPE
+      qadmcli journal disable -t "%TEST%" -l MYLIB --dry-run
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Check if wildcard pattern (* and ? are shell-style, % is SQL-style)
+            # Note: _ is a valid character in IBM i table names, not a wildcard
+            if '*' in table or '%' in table or '?' in table:
+                # Find matching tables
+                from .db.schema import SchemaManager
+                import fnmatch
+                schema_mgr = SchemaManager(conn)
+                all_tables = schema_mgr.list_tables(library)
+                
+                # Filter tables by pattern (convert SQL wildcards to fnmatch pattern)
+                pattern = name.replace('%', '*').replace('_', '?')
+                tables = [t for t in all_tables if fnmatch.fnmatch(t.name, pattern)]
+                
+                if not tables:
+                    console.print(f"[yellow]No tables matching pattern '{table}' in {library}[/yellow]")
+                    return
+                
+                if dry_run:
+                    console.print(f"[blue]Dry run - would disable journaling for {len(tables)} table(s):[/blue]")
+                    for table in tables:
+                        console.print(f"  - {table.name}")
+                    return
+                
+                # Process each table
+                results = []
+                success_count = 0
+                error_count = 0
+                
+                console.print(f"[blue]Disabling journaling for {len(tables)} table(s)...[/blue]")
+                for table in tables:
+                    try:
+                        result = jrn.disable_journaling(table.name, library)
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": True
+                        })
+                        success_count += 1
+                        console.print(f"  [green]OK[/green] {library}.{table.name}")
+                    except Exception as e:
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": False,
+                            "error": str(e)
+                        })
+                        error_count += 1
+                        console.print(f"  [red]ERR[/red] {library}.{table.name}: {e}")
+                
+                if output_format == "json":
+                    print_json_clean({
+                        "operation": "disable",
+                        "pattern": name,
+                        "library": library,
+                        "total": len(tables),
+                        "success": success_count,
+                        "errors": error_count,
+                        "results": results
+                    })
+                else:
+                    console.print(f"\n[green]Completed: {success_count} succeeded, {error_count} failed[/green]")
+            else:
+                # Single table
+                if dry_run:
+                    console.print(f"[blue]Dry run - would disable journaling for {library}.{table}[/blue]")
+                    return
+                
+                result = jrn.disable_journaling(table, library)
+                
+                if output_format == "json":
+                    print_json_clean(result)
+                else:
+                    console.print(f"[green]Disabled journaling for {library}.{table}[/green]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("enable")
+@click.option("--table", "-t", required=True, help="Table name (supports wildcards: * or %)")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--journal-library", "-j", help="Journal library (default from config)")
+@click.option("--journal-name", help="Journal name (default from config)")
+@click.option("--images", "-i", type=click.Choice(["*BOTH", "*AFTER", "*BEFORE"]), 
+              default="*AFTER", help="Journal images to capture (default: *AFTER)")
+@click.option("--dry-run", is_flag=True, help="Show which tables would be affected without making changes")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_enable(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    journal_library: str | None,
+    journal_name: str | None,
+    images: str,
+    dry_run: bool,
+    output_format: str
+) -> None:
+    """Enable journaling for one or more tables.
+    
+    Supports wildcards:
+      - * or % for multiple characters
+      - ? or _ for single character
+    
+    Examples:
+      qadmcli journal enable -t TB_01 -l EZPIPE
+      qadmcli journal enable -t "TB_*" -l EZPIPE --images *BOTH
+      qadmcli journal enable -t "%TEST%" -l MYLIB -j MYLIB --dry-run
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Check if wildcard pattern (* and ? are shell-style, % is SQL-style)
+            # Note: _ is a valid character in IBM i table names, not a wildcard
+            if '*' in table or '%' in table or '?' in table:
+                # Find matching tables
+                from .db.schema import SchemaManager
+                import fnmatch
+                schema_mgr = SchemaManager(conn)
+                all_tables = schema_mgr.list_tables(library)
+                
+                # Filter tables by pattern (convert SQL wildcards to fnmatch pattern)
+                pattern = name.replace('%', '*').replace('_', '?')
+                tables = [t for t in all_tables if fnmatch.fnmatch(t.name, pattern)]
+                
+                if not tables:
+                    console.print(f"[yellow]No tables matching pattern '{table}' in {library}[/yellow]")
+                    return
+                
+                if dry_run:
+                    console.print(f"[blue]Dry run - would enable journaling for {len(tables)} table(s):[/blue]")
+                    for table in tables:
+                        console.print(f"  - {table.name} (images: {images})")
+                    return
+                
+                # Process each table
+                results = []
+                success_count = 0
+                error_count = 0
+                
+                console.print(f"[blue]Enabling journaling for {len(tables)} table(s) with {images}...[/blue]")
+                for table in tables:
+                    try:
+                        result = jrn.enable_journaling(table.name, library, journal_library, journal_name, images)
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": True,
+                            "journal": result['journal']
+                        })
+                        success_count += 1
+                        console.print(f"  [green]OK[/green] {library}.{table.name} -> {result['journal']}")
+                    except Exception as e:
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": False,
+                            "error": str(e)
+                        })
+                        error_count += 1
+                        console.print(f"  [red]ERR[/red] {library}.{table.name}: {e}")
+                
+                if output_format == "json":
+                    print_json_clean({
+                        "operation": "enable",
+                        "pattern": name,
+                        "library": library,
+                        "images": images,
+                        "total": len(tables),
+                        "success": success_count,
+                        "errors": error_count,
+                        "results": results
+                    })
+                else:
+                    console.print(f"\n[green]Completed: {success_count} succeeded, {error_count} failed[/green]")
+                    console.print(f"Images mode: {images}")
+            else:
+                # Single table
+                if dry_run:
+                    console.print(f"[blue]Dry run - would enable journaling for {library}.{table} with {images}[/blue]")
+                    return
+                
+                result = jrn.enable_journaling(table, library, journal_library, journal_name, images)
+                
+                if output_format == "json":
+                    print_json_clean(result)
+                else:
+                    console.print(f"[green]Enabled journaling for {library}.{table}[/green]")
+                    console.print(f"Journal: {result['journal']}")
+                    console.print(f"Images: {images}")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("entries")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--limit", default=100, help="Number of entries to retrieve (default: 100)")
+@click.option("--from-time", help="Filter entries from timestamp (ISO 8601: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)")
+@click.option("--to-time", help="Filter entries to timestamp (ISO 8601: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)")
+@click.option("--format", "output_format", type=click.Choice(["sql", "json", "summary"]), default="sql", help="Output format")
+@click.pass_context
+def journal_entries(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    limit: int,
+    from_time: str | None,
+    to_time: str | None,
+    output_format: str
+) -> None:
+    """Get journal entries for a table.
+    
+    Use --format summary to get operation counts (useful for comparison with MSSQL CT).
+    """
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output to keep it clean
+    if output_format in ("json", "summary"):
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            if output_format == "summary":
+                # Get summary only
+                summary = jrn.get_journal_summary(table, library, from_time, to_time)
+                print_json_clean(summary)
+            else:
+                # Get full entries
+                entries = jrn.get_journal_entries(
+                    table, library, 
+                    limit=limit,
+                    from_time=from_time,
+                    to_time=to_time
+                )
+                
+                if output_format == "json":
+                    data = [e.model_dump() for e in entries]
+                    print_json_clean(data)
+                else:
+                    # SQL format
+                    if not entries:
+                        console.print("[yellow]No journal entries found for this table.[/yellow]")
+                    else:
+                        for entry in entries:
+                            sql = entry.to_sql()
+                            if sql:
+                                console.print(f"-- Entry {entry.entry_number} ({entry.operation}) at {entry.entry_timestamp}")
+                                console.print(f"{sql}\n")
+                            else:
+                                # Show entry info even if SQL can't be generated
+                                console.print(f"-- Entry {entry.entry_number} ({entry.entry_type or 'Unknown'}) at {entry.entry_timestamp}")
+                                console.print(f"-- Job: {entry.job_name}, User: {entry.job_user}, Program: {entry.program_name}")
+                                if entry.raw_entry_data:
+                                    console.print(f"-- Raw data: {entry.raw_entry_data[:100]}...\n")
+                                else:
+                                    console.print("-- No data available\n")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("list")
+@click.option("--library", "-l", help="Filter by library name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_list(ctx: click.Context, library: str | None, output_format: str) -> None:
+    """List all journals with their sizes and status."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.journal import JournalManager
+            jrn = JournalManager(conn)
+            journals = jrn.list_journals(library)
+            
+            if output_format == "json":
+                print_json_clean([j.model_dump() for j in journals])
+            else:
+                if journals:
+                    rows = []
+                    for j in journals:
+                        # Determine size category
+                        total_entries = j.get('total_entries', 0) or 0
+                        if total_entries < 10000:
+                            size_cat = "[green]Small[/green]"
+                        elif total_entries < 1000000:
+                            size_cat = "[yellow]Medium[/yellow]"
+                        else:
+                            size_cat = "[red]Large[/red]"
+                        
+                        rows.append([
+                            f"{j['journal_library']}.{j['journal_name']}",
+                            str(j.get('receiver_count', 0)),
+                            f"{total_entries:,}" if total_entries else "N/A",
+                            size_cat,
+                            j.get('attached_receiver', 'N/A') or 'N/A'
+                        ])
+                    
+                    console.print(print_table(
+                        console,
+                        ["Journal", "Receivers", "Total Entries", "Size", "Current Receiver"],
+                        rows,
+                        title="Journal List"
+                    ))
+                else:
+                    console.print("[yellow]No journals found[/yellow]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("receivers")
+@click.option("--journal", "-j", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_receivers(ctx: click.Context, journal: str, library: str, output_format: str) -> None:
+    """Show journal receiver chain with cleanup recommendations."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            receivers = jrn.get_receiver_chain(journal, library)
+            
+            if output_format == "json":
+                print_json_clean(receivers)
+            else:
+                if receivers:
+                    rows = []
+                    for r in receivers:
+                        status_icon = "🟢" if r['status'] == 'ATTACHED' else "🔵" if r['status'] == 'ONLINE' else "⚪"
+                        cleanup = "[red]KEEP (Attached)[/red]" if r['status'] == 'ATTACHED' else "[green]Safe to cleanup[/green]"
+                        rows.append([
+                            r['receiver_name'],
+                            r['status'],
+                            f"{r['entries']:,}" if r['entries'] else "N/A",
+                            f"{r['size_mb']:.2f} MB" if r['size_mb'] else "N/A",
+                            cleanup
+                        ])
+                    
+                    console.print(print_table(
+                        console,
+                        ["Receiver", "Status", "Entries", "Size", "Cleanup Status"],
+                        rows,
+                        title=f"Journal Receivers: {library}.{journal}"
+                    ))
+                    
+                    # Summary
+                    total_receivers = len(receivers)
+                    attached = sum(1 for r in receivers if r['status'] == 'ATTACHED')
+                    online = sum(1 for r in receivers if r['status'] == 'ONLINE')
+                    console.print(f"\n[blue]Summary:[/blue] {total_receivers} receivers total ({attached} attached, {online} online, {total_receivers - attached - online} other)")
+                    if online > 0:
+                        console.print(f"[yellow]Tip:[/yellow] {online} receiver(s) can be saved and deleted to free space")
+                else:
+                    console.print(f"[yellow]No receivers found for {library}.{journal}[/yellow]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("cleanup")
+@click.option("--journal", "-j", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--keep", "-k", default=2, help="Number of recent receivers to keep (default: 2)")
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted without executing")
+@click.pass_context
+def journal_cleanup(ctx: click.Context, journal: str, library: str, keep: int, dry_run: bool) -> None:
+    """Clean up old journal receivers (keeps attached + N recent)."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Get cleanup plan
+            plan = jrn.get_cleanup_plan(journal, library, keep)
+            
+            if not plan['to_delete']:
+                console.print(f"[green]No receivers to clean up for {library}.{journal}[/green]")
+                return
+            
+            # Show plan
+            console.print(f"\n[blue]Cleanup Plan for {library}.{journal}:[/blue]")
+            console.print(f"Keeping: {plan['keeping']} receiver(s)")
+            console.print(f"Deleting: {plan['deleting']} receiver(s)")
+            console.print(f"Space to free: {plan['space_mb']:.2f} MB\n")
+            
+            if plan['to_delete']:
+                rows = []
+                for r in plan['to_delete']:
+                    rows.append([r['receiver_name'], f"{r['entries']:,}", f"{r['size_mb']:.2f} MB"])
+                console.print(print_table(
+                    console,
+                    ["Receiver", "Entries", "Size"],
+                    rows,
+                    title="Receivers to Delete"
+                ))
+            
+            if dry_run:
+                console.print(f"\n[yellow]Dry run mode - no changes made[/yellow]")
+                console.print(f"Run without --dry-run to execute cleanup")
+            else:
+                console.print(f"\n[yellow]Executing cleanup...[/yellow]")
+                results = jrn.execute_cleanup(plan)
+                
+                success = sum(1 for r in results if r['success'])
+                failed = len(results) - success
+                
+                console.print(f"[green]Cleanup complete:[/green] {success} deleted, {failed} failed")
+                
+                if failed > 0:
+                    for r in results:
+                        if not r['success']:
+                            console.print(f"[red]Failed:[/red] {r['receiver_name']} - {r['error']}")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("monitor")
+@click.option("--library", "-l", help="Monitor specific library")
+@click.option("--threshold", "-t", default=1000000, help="Entry count threshold for warning (default: 1M)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_monitor(ctx: click.Context, library: str | None, threshold: int, output_format: str) -> None:
+    """Monitor journal sizes and alert on large journals."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            journals = jrn.list_journals(library)
+            
+            alerts = []
+            rows = []
+            
+            for j in journals:
+                entries = j.get('total_entries', 0) or 0
+                
+                if entries > threshold * 5:
+                    status = "[red]CRITICAL[/red]"
+                    alerts.append(f"{j['journal_library']}.{j['journal_name']}: {entries:,} entries")
+                elif entries > threshold:
+                    status = "[yellow]WARNING[/yellow]"
+                    alerts.append(f"{j['journal_library']}.{j['journal_name']}: {entries:,} entries")
+                else:
+                    status = "[green]OK[/green]"
+                
+                rows.append([
+                    f"{j['journal_library']}.{j['journal_name']}",
+                    f"{entries:,}",
+                    str(j.get('receiver_count', 0)),
+                    status
+                ])
+            
+            if output_format == "json":
+                print_json_clean({
+                    'journals': journals,
+                    'alerts': alerts,
+                    'threshold': threshold
+                })
+            else:
+                console.print(print_table(
+                    console,
+                    ["Journal", "Entries", "Receivers", "Status"],
+                    rows,
+                    title=f"Journal Monitor (Threshold: {threshold:,} entries)"
+                ))
+                
+                if alerts:
+                    console.print(f"\n[yellow]⚠️  Alerts ({len(alerts)}):[/yellow]")
+                    for alert in alerts:
+                        console.print(f"  • {alert}")
+                    console.print(f"\n[blue]Recommendation:[/blue] Use 'journal cleanup' or 'journal receivers' to manage large journals")
+                else:
+                    console.print(f"\n[green]✓ All journals within threshold[/green]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("info")
+@click.option("--table", "-t", required=True, help="Table name (supports wildcards: * or %)")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--fast", "-f", is_flag=True, help="Skip slow entry range query (for large journals)")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_info(ctx: click.Context, table: str, library: str, fast: bool, output_format: str) -> None:
+    """Get detailed journal information for one or more tables.
+    
+    Supports wildcards:
+      - * or % for multiple characters
+      - ? for single character
+    
+    Examples:
+      qadmcli journal info -t TB_01 -l EZPIPE
+      qadmcli journal info -t "TB_*" -l EZPIPE --fast
+      qadmcli journal info -t "TEST*" -l MYLIB
+    """
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output
+    if output_format == "json":
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Check if wildcard pattern (* and ? are shell-style, % is SQL-style)
+            if '*' in table or '%' in table or '?' in table:
+                # Find matching tables
+                from .db.schema import SchemaManager
+                import fnmatch
+                schema_mgr = SchemaManager(conn)
+                all_tables = schema_mgr.list_tables(library)
+                
+                # Filter tables by pattern
+                pattern = table.replace('%', '*')
+                tables = [t for t in all_tables if fnmatch.fnmatch(t.name, pattern)]
+                
+                if not tables:
+                    console.print(f"[yellow]No tables matching pattern '{table}' in {library}[/yellow]")
+                    return
+                
+                # Process each table
+                results = []
+                console.print(f"[blue]Journal info for {len(tables)} table(s):[/blue]\n")
+                
+                # Temporarily suppress INFO logging for cleaner batch output
+                import logging
+                original_level = logging.getLogger("qadmcli").level
+                logging.getLogger("qadmcli").setLevel(logging.WARNING)
+                
+                try:
+                    for table in tables:
+                        try:
+                            info = jrn.get_journal_info(table.name, library, skip_entry_range=fast)
+                            results.append({
+                                "table": f"{library}.{table.name}",
+                                "info": info.model_dump()
+                            })
+                            
+                            # Format journal images for display
+                            images_display = info.journal_images or "N/A"
+                            if images_display == "*BOTH":
+                                images_display = "BOTH"
+                            elif images_display == "*AFTER":
+                                images_display = "AFTER"
+                            elif images_display == "*BEFORE":
+                                images_display = "BEFORE"
+                            
+                            # Compact display for batch mode
+                            status = "Journaled" if info.is_journaled else "Not Journaled"
+                            journal_info = f"{info.journal_library}.{info.journal_name}" if info.journal_library else "N/A"
+                            console.print(f"  {library}.{table.name}: {status} | {images_display} | {journal_info}")
+                            
+                        except Exception as e:
+                            results.append({
+                                "table": f"{library}.{table.name}",
+                                "error": str(e)
+                            })
+                            console.print(f"  [red]ERR[/red] {library}.{table.name}: {e}")
+                finally:
+                    # Restore original logging level
+                    logging.getLogger("qadmcli").setLevel(original_level)
+                
+                if output_format == "json":
+                    print_json_clean({
+                        "pattern": table,
+                        "library": library,
+                        "tables": results
+                    })
+            else:
+                # Single table
+                info = jrn.get_journal_info(table, library, skip_entry_range=fast)
+                
+                if output_format == "json":
+                    print_json_clean(info.model_dump())
+                else:
+                    # Format journal images for display
+                    images_display = info.journal_images or "N/A"
+                    if images_display == "*BOTH":
+                        images_display = "BOTH (Before & After)"
+                    elif images_display == "*AFTER":
+                        images_display = "AFTER (After image only)"
+                    elif images_display == "*BEFORE":
+                        images_display = "BEFORE (Before image only)"
+                    
+                    content = Text.assemble(
+                        ("Table: ", "bold"), f"{library}.{table}", "\n\n",
+                        ("Journal Status:\n", "bold underline"),
+                        ("  Journaled: ", "bold"), ("Yes" if info.is_journaled else "No"), "\n",
+                        ("  Journal: ", "bold"), (f"{info.journal_library}.{info.journal_name}" if info.journal_library else "N/A"), "\n",
+                        ("  Write Mode: ", "bold"), images_display, "\n",
+                        ("  Receiver: ", "bold"), (f"{info.journal_receiver_library}.{info.journal_receiver_name}" if info.journal_receiver_library else "N/A"), "\n",
+                        ("  Receiver Attached: ", "bold"), str(info.receiver_attach_timestamp or "N/A"), "\n",
+                        ("  Receiver Detached: ", "bold"), str(info.receiver_detach_timestamp or "Still attached"), "\n\n",
+                        ("Table Entry Range:\n", "bold underline"),
+                        ("  Oldest Sequence: ", "bold"), str(info.oldest_entry_sequence or "N/A"), "\n",
+                        ("  Newest Sequence: ", "bold"), str(info.newest_entry_sequence or "N/A"), "\n",
+                        ("  Oldest Time: ", "bold"), str(info.oldest_entry_timestamp or "N/A"), "\n",
+                        ("  Newest Time: ", "bold"), str(info.newest_entry_timestamp or "N/A"), "\n",
+                        ("  Total Entries: ", "bold"), str(info.total_entries or "N/A"),
+                    )
+                    print_panel(ctx, content, title="Detailed Journal Information", border_style="blue")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("create-receiver")
+@click.option("--name", "-n", required=True, help="Journal receiver name")
+@click.option("--library", "-l", required=True, help="Library for journal receiver")
+@click.option("--threshold", "-t", default="*NONE", help="Size threshold (e.g., '100000' or '*NONE')")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_create_receiver(
+    ctx: click.Context,
+    name: str,
+    library: str,
+    threshold: str,
+    output_format: str
+) -> None:
+    """Create a standalone journal receiver (not attached to any journal)."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            result = jrn.create_journal_receiver(name, library, threshold)
+            
+            console.print(f"[green]Created journal receiver {library}.{name}[/green]")
+            console.print("[yellow]Note: Receiver is not attached to any journal.[/yellow]")
+            console.print("Use 'journal rollover' to attach it to a journal.")
+            if threshold != "*NONE":
+                console.print(f"Threshold: {threshold} KB")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("rollover")
+@click.option("--journal", "-j", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--receiver", "-r", help="New receiver name (auto-generated if not specified)")
+@click.option("--receiver-library", "-rl", help="Library for new receiver (defaults to journal library)")
+@click.pass_context
+def journal_rollover(
+    ctx: click.Context,
+    journal: str,
+    library: str,
+    receiver: str | None,
+    receiver_library: str | None
+) -> None:
+    """Rollover journal to a new receiver (detaches current, attaches new).
+    
+    This creates a new receiver and attaches it to the journal, automatically
+    detaching the current receiver. The detached receiver becomes ONLINE status
+    and can be cleaned up later.
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Get current receiver before rollover
+            old_receivers = jrn.get_receiver_chain(journal, library)
+            old_attached = [r for r in old_receivers if r['status'] == 'ATTACHED']
+            old_name = old_attached[0]['receiver_name'] if old_attached else 'Unknown'
+            
+            # Perform rollover
+            result = jrn.rollover_journal(journal, library, receiver, receiver_library)
+            
+            console.print(f"[green]Journal rollover complete:[/green] {library}.{journal}")
+            console.print(f"  Old receiver: {old_name} (now ONLINE)")
+            console.print(f"  New receiver: {result['new_receiver']} (now ATTACHED)")
+            console.print(f"\n[blue]Tip:[/blue] Use 'journal receivers -j {journal} -l {library}' to view the chain")
+            console.print(f"      Use 'journal cleanup -j {journal} -l {library}' to remove old receivers")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("create")
+@click.option("--name", "-n", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library for journal")
+@click.option("--receiver", "-r", required=True, help="Journal receiver name")
+@click.option("--receiver-library", "-rl", help="Journal receiver library (defaults to journal library)")
+@click.option("--msg-queue", "-m", default="*NONE", help="Message queue for journal messages")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_create(
+    ctx: click.Context,
+    name: str,
+    library: str,
+    receiver: str,
+    receiver_library: str | None,
+    msg_queue: str,
+    output_format: str
+) -> None:
+    """Create a journal."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            result = jrn.create_journal(name, library, receiver, receiver_library, msg_queue)
+            
+            recv_lib = receiver_library or library
+            console.print(f"[green]Created journal {library}.{name}[/green]")
+            console.print(f"Attached to receiver: {recv_lib}.{receiver}")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+def user() -> None:
+    """User management commands."""
+    pass
+
+
+@user.command("list")
+@click.option("--filter", "-f", help="Filter users by name (supports wildcards like 'Q*' or '%USER%')")
+@click.option("--active-only", "-a", is_flag=True, help="Show only active/enabled users")
+@click.option("--limit", "-n", type=int, default=100, help="Maximum number of users to display (default: 100)")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def user_list(
+    ctx: click.Context,
+    filter: str | None,
+    active_only: bool,
+    limit: int,
+    output_format: str
+) -> None:
+    """List user profiles with status and library information."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            # Convert wildcards for SQL LIKE
+            sql_filter = None
+            if filter:
+                sql_filter = filter.replace("*", "%").replace("?", "_")
+            
+            users = user_mgr.list_users(filter_name=sql_filter, only_active=active_only)
+            
+            if output_format == "json":
+                print_json_clean({"users": users[:limit], "total": len(users), "shown": min(len(users), limit)})
+            else:
+                if not users:
+                    console.print("[yellow]No users found matching the criteria.[/yellow]")
+                    return
+                
+                # Build table rows
+                rows = []
+                for u in users[:limit]:
+                    # Status indicator
+                    status_indicator = "🟢" if u["status"] == "*ENABLED" else "🔴"
+                    
+                    # Format last signon
+                    last_signon = u.get("last_signon")
+                    if last_signon:
+                        try:
+                            last_signon_str = last_signon.strftime("%Y-%m-%d %H:%M")
+                        except:
+                            last_signon_str = str(last_signon)[:16]
+                    else:
+                        last_signon_str = "Never"
+                    
+                    rows.append([
+                        status_indicator,
+                        u["username"],
+                        u.get("user_class", ""),
+                        u.get("status_description", ""),
+                        u.get("group_profile", "*NONE"),
+                        last_signon_str
+                    ])
+                
+                # Display table
+                console.print(print_table(
+                    console,
+                    ["", "Username", "Class", "Status", "Group Profile", "Last Signon"],
+                    rows,
+                    title=f"User Profiles ({min(len(users), limit)} of {len(users)} shown)"
+                ))
+                
+                if len(users) > limit:
+                    console.print(f"[dim]... and {len(users) - limit} more users (use --limit to show more)[/dim]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("check")
+@click.option("--user", "-u", required=True, help="Username to check")
+@click.option("--library", "-l", help="Library to check permissions on")
+@click.option("--name", "-n", help="Table name(s) to check (supports wildcards like 'customer*')")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def user_check(
+    ctx: click.Context,
+    user: str,
+    library: str | None,
+    name: str | None,
+    output_format: str
+) -> None:
+    """Check user existence and permissions."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            result = user_mgr.check_user(user, library, name)
+            
+            if output_format == "json":
+                print_json_clean(result)
+            else:
+                if result["exists"]:
+                    user_class = str(result.get("user_class", "N/A"))
+                    status = str(result.get("status", "N/A"))
+                    
+                    # Build user info content for panel
+                    user_info_content = f"""User: {user}
+Exists: Yes
+User Class: {user_class}
+Status: {status}"""
+                    
+                    print_panel(
+                        ctx,
+                        user_info_content,
+                        title="User Information",
+                        border_style="green"
+                    )
+                    
+                    if result.get("permissions"):
+                        rows = []
+                        for perm in result["permissions"]:
+                            rows.append([
+                                perm.get("object", ""),
+                                perm.get("object_type", ""),
+                                perm.get("authority", "")
+                            ])
+                        console.print(print_table(
+                            console,
+                            ["Object", "Type", "Authority"],
+                            rows,
+                            title="Table Permissions"
+                        ))
+                    
+                    # Display journal permissions
+                    if result.get("journal_permissions"):
+                        rows = []
+                        for perm in result["journal_permissions"]:
+                            rows.append([
+                                perm.get("object", ""),
+                                perm.get("object_type", ""),
+                                perm.get("authority", "")
+                            ])
+                        console.print(print_table(
+                            console,
+                            ["Object", "Type", "Authority"],
+                            rows,
+                            title="Journal Permissions"
+                        ))
+                    elif library:
+                        console.print("[yellow]No journal permissions found in library {library}.[/yellow]".format(library=library))
+                else:
+                    console.print(f"[yellow]User {user} does not exist.[/yellow]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("check-table")
+@click.option("--user", "-u", required=True, help="Username to check")
+@click.option("--table", "-t", required=True, help="Table name to check")
+@click.option("--library", "-l", required=True, help="Library containing the table")
+@click.pass_context
+def user_check_table(
+    ctx: click.Context,
+    user: str,
+    table: str,
+    library: str
+) -> None:
+    """Check user permissions for a specific table and its related journal objects.
+    
+    Shows a consolidated view of permissions on:
+    - The table itself
+    - The journal (even if in different library)
+    - The journal receiver
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            result = user_mgr.check_table_permissions_with_journal(user, table, library)
+            
+            if output_format == "json":
+                print_json_clean(result)
+            else:
+                # Build consolidated view
+                print_panel(
+                    ctx,
+                    f"Checking permissions for {user} on {library}.{table}",
+                    title="Table Permission Check",
+                    border_style="blue"
+                )
+                
+                # Display user info (group profile and special authorities)
+                user_info_lines = []
+                if result["user_info"]["group_profile"] and result["user_info"]["group_profile"] != "*NONE":
+                    user_info_lines.append(["Group Profile", result["user_info"]["group_profile"]])
+                if result["user_info"]["special_authorities"] and result["user_info"]["special_authorities"] != "*NONE":
+                    user_info_lines.append(["Special Authorities", result["user_info"]["special_authorities"]])
+                
+                if user_info_lines:
+                    console.print(print_table(
+                        console,
+                        ["Attribute", "Value"],
+                        user_info_lines,
+                        title="User Information"
+                    ))
+                
+                # Helper function to format authority details
+                def format_auth_details(details: list) -> str:
+                    if not details:
+                        return "No explicit authority found"
+                    lines = []
+                    for d in details:
+                        auth = d["authority"]
+                        source = d["source"]
+                        lines.append(f"  - {source}: {auth}")
+                    return "\n".join(lines)
+                
+                # Table info with authority sources
+                table_auth = result["table"]["authority"] or "*NONE"
+                table_source = result["table"]["source"] or "N/A"
+                table_details = format_auth_details(result["table"]["details"])
+                
+                table_rows = [
+                    ["Object", f"{result['table']['library']}.{result['table']['name']}"],
+                    ["Type", "*FILE"],
+                    ["Effective Authority", table_auth],
+                    ["Primary Source", table_source],
+                    ["Authority Details", table_details]
+                ]
+                console.print(print_table(
+                    console,
+                    ["Property", "Value"],
+                    table_rows,
+                    title="Table Permissions"
+                ))
+                
+                # Journal info (if table is journaled)
+                if result["journal"]["name"]:
+                    jrn_auth = result["journal"]["authority"] or "*NONE"
+                    jrn_source = result["journal"]["source"] or "N/A"
+                    jrn_details = format_auth_details(result["journal"]["details"])
+                    
+                    jrn_rows = [
+                        ["Object", f"{result['journal']['library']}.{result['journal']['name']}"],
+                        ["Type", "*JRN"],
+                        ["Effective Authority", jrn_auth],
+                        ["Primary Source", jrn_source],
+                        ["Authority Details", jrn_details]
+                    ]
+                    console.print(print_table(
+                        console,
+                        ["Property", "Value"],
+                        jrn_rows,
+                        title="Journal Permissions"
+                    ))
+                    
+                    # Journal receiver info
+                    if result["journal_receiver"]["name"]:
+                        rcv_auth = result["journal_receiver"]["authority"] or "*NONE"
+                        rcv_source = result["journal_receiver"]["source"] or "N/A"
+                        rcv_details = format_auth_details(result["journal_receiver"]["details"])
+                        
+                        rcv_rows = [
+                            ["Object", f"{result['journal_receiver']['library']}.{result['journal_receiver']['name']}"],
+                            ["Type", "*JRNRCV"],
+                            ["Effective Authority", rcv_auth],
+                            ["Primary Source", rcv_source],
+                            ["Authority Details", rcv_details]
+                        ]
+                        console.print(print_table(
+                            console,
+                            ["Property", "Value"],
+                            rcv_rows,
+                            title="Journal Receiver Permissions"
+                        ))
+                    
+                    # Summary
+                    all_auths = [table_auth, jrn_auth, rcv_auth]
+                    if all(a in ["*ALL", "*CHANGE"] for a in all_auths):
+                        console.print("[green]User has full permissions on table and journal objects.[/green]")
+                    elif "*NONE" in all_auths or None in all_auths:
+                        console.print("[yellow]Warning: User may have insufficient permissions on some objects.[/yellow]")
+                else:
+                    console.print("[yellow]Table is not journaled.[/yellow]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("create")
+@click.option("--user", "-u", required=True, help="Username to create")
+@click.option("--password", "-p", help="Password for the user")
+@click.option("--library", "-l", help="Library to grant permissions on")
+@click.option("--name", "-n", help="Table name(s) to grant permissions (supports wildcards)")
+@click.option("--admin-user", "-U", help="Administrative user with *SECADM authority (for privilege escalation)")
+@click.option("--admin-password", "-P", help="Password for administrative user")
+@click.pass_context
+def user_create(
+    ctx: click.Context,
+    user: str,
+    password: str | None,
+    library: str | None,
+    name: str | None,
+    admin_user: str | None,
+    admin_password: str | None
+) -> None:
+    """Create a new user with optional permissions.
+    
+    If the current user lacks *SECADM authority, you can provide admin credentials
+    using --admin-user and --admin-password, or you will be prompted interactively.
+    
+    Examples:
+        qadmcli user create -u newuser -p password123
+        qadmcli user create -u newuser -p password123 -U QSECOFR -P adminpass
+        qadmcli user create -u newuser -p password123 -l MYLIB -n "*ALL"
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            try:
+                result = user_mgr.create_user(user, password)
+                console.print(f"[green]Created user {user}[/green]")
+            except Exception as e:
+                error_msg = str(e)
+                # Check for authority errors (CPF0006, CPF22E2, CPF2292)
+                if any(code in error_msg for code in ["CPF0006", "CPF22E2", "CPF2292"]) or "authority" in error_msg.lower():
+                    if "CPF2292" in error_msg:
+                        console.print("[yellow]Current user lacks *SECADM (Security Administrator) special authority.[/yellow]")
+                        console.print("[dim]To create users, you need a profile with *SECADM authority.[/dim]")
+                    else:
+                        console.print("[yellow]Current user lacks authority to create users.[/yellow]")
+                    
+                    # Get admin credentials
+                    admin_conn = _get_elevated_connection(
+                        config, admin_user, admin_password, "*SECADM authority required"
+                    )
+                    
+                    if admin_conn:
+                        try:
+                            admin_user_mgr = UserManager(admin_conn)
+                            result = admin_user_mgr.create_user(user, password)
+                            console.print(f"[green]Created user {user} using elevated privileges[/green]")
+                            admin_conn.disconnect()
+                        except Exception as admin_e:
+                            admin_conn.disconnect()
+                            # Check if elevated user also lacks *SECADM
+                            admin_error = str(admin_e)
+                            if "CPF2292" in admin_error:
+                                console.print("[red]The administrative user also lacks *SECADM authority.[/red]")
+                                console.print("[dim]Hint: Verify the admin user has *SECADM special authority:[/dim]")
+                                console.print(f"[dim]  qadmcli sql execute -q \"SELECT AUTHORIZATION_NAME, SPECIAL_AUTHORITIES FROM QSYS2.USER_INFO WHERE AUTHORIZATION_NAME = '<admin_user>'\"[/dim]")
+                            raise admin_e
+                    else:
+                        console.print("[red]Operation cancelled. User not created.[/red]")
+                        sys.exit(1)
+                else:
+                    raise
+            
+            if library:
+                # Grant permissions on library/tables using original connection
+                user_mgr.grant_library_permissions(user, library, name)
+                console.print(f"[green]Granted permissions on {library}[/green]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("delete")
+@click.option("--user", "-u", required=True, help="Username to delete")
+@click.option("--force", "-f", is_flag=True, help="Force delete without confirmation")
+@click.pass_context
+def user_delete(
+    ctx: click.Context,
+    user: str,
+    force: bool
+) -> None:
+    """Delete a user."""
+    config_path = ctx.obj["config_path"]
+    
+    if not force:
+        console.print(f"[yellow]Warning: This will permanently delete user {user}[/yellow]")
+        console.print("Use --force to confirm.")
+        sys.exit(1)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            user_mgr.delete_user(user)
+            console.print(f"[green]Deleted user {user}[/green]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("grant")
+@click.option("--user", "-u", required=True, help="Username to grant permissions to")
+@click.option("--grant", "-g", "grant_option", required=True, 
+              type=click.Choice(["*ALL", "*CHANGE", "*USE", "*EXCLUDE", "*ALLOBJ", "*SECADM", 
+                                "*JOBCTL", "*SPLCTL", "*SAVSYS", "*SERVICE", "*AUDIT", "*IOSYSCFG"]),
+              help="Authority to grant")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--name", "-n", help="Object name(s) (supports wildcards like 'customer*')")
+@click.option("--object-type", "-t", default="*FILE",
+              type=click.Choice(["*FILE", "*JRN", "*JRNRCV", "*LIB", "*ALL"]),
+              help="Object type (default: *FILE)")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def user_grant(
+    ctx: click.Context,
+    user: str,
+    grant_option: str,
+    library: str,
+    name: str | None,
+    object_type: str,
+    output_format: str
+) -> None:
+    """Grant authority to a user on library/objects.
+    
+    Common authority options:
+    - *ALL: All authority
+    - *CHANGE: Read and modify authority
+    - *USE: Use authority (read/execute)
+    - *EXCLUDE: No authority
+    - *ALLOBJ: All object authority (special)
+    
+    Object types:
+    - *FILE: Database files (tables)
+    - *JRN: Journals
+    - *JRNRCV: Journal receivers
+    - *LIB: Libraries
+    - *ALL: All object types
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            object_name = name.upper() if name else "*ALL"
+            user_mgr.grant_object_authority(user, library, object_name, grant_option, object_type)
+            
+            console.print(f"[green]Granted {grant_option} authority to {user}[/green]")
+            console.print(f"Object: {library}.{object_name} ({object_type})")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("password")
+@click.option("--user", "-u", required=True, help="Username")
+@click.option("--password", "-p", required=True, help="New password")
+@click.pass_context
+def user_password(
+    ctx: click.Context,
+    user: str,
+    password: str
+) -> None:
+    """Reset user password."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            user_mgr.change_password(user, password)
+            console.print(f"[green]Password changed for user {user}[/green]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("modify")
+@click.option("--user", "-u", required=True, help="Username to modify")
+@click.option("--class", "user_class", help="User class (*USER, *PGMR, *SYSOPR, *SECADM, *SECOFR)")
+@click.option("--status", "user_status", type=click.Choice(["*ENABLED", "*DISABLED"]), help="Enable or disable user")
+@click.option("--group", "group_profile", help="Group profile name")
+@click.option("--text", "text_description", help="Text description for user")
+@click.option("--admin-user", "-U", help="Administrative user with *SECADM authority (for privilege escalation)")
+@click.option("--admin-password", "-P", help="Password for administrative user")
+@click.pass_context
+def user_modify(
+    ctx: click.Context,
+    user: str,
+    user_class: str | None,
+    user_status: str | None,
+    group_profile: str | None,
+    text_description: str | None,
+    admin_user: str | None,
+    admin_password: str | None
+) -> None:
+    """Modify user profile attributes.
+    
+    If the current user lacks *SECADM authority, you can provide admin credentials
+    using --admin-user and --admin-password, or you will be prompted interactively.
+    
+    Examples:
+        qadmcli user modify -u GSUSER01 --class *PGMR
+        qadmcli user modify -u GLUEUSR --class *USER -U QSECOFR -P adminpass
+        qadmcli user modify -u OLDUSER --status *DISABLED --text "Disabled account"
+    """
+    config_path = ctx.obj["config_path"]
+    
+    # Check that at least one option is provided
+    if not any([user_class, user_status, group_profile, text_description]):
+        console.print("[red]Error: At least one modification option must be provided[/red]")
+        console.print("Use --class, --status, --group, or --text")
+        sys.exit(1)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            try:
+                result = user_mgr.modify_user(
+                    user,
+                    user_class=user_class,
+                    status=user_status,
+                    group_profile=group_profile,
+                    text_description=text_description
+                )
+                
+                console.print(f"[green]User {user} modified successfully[/green]")
+                
+                # Show what was changed
+                if result.get("changes"):
+                    for change in result["changes"]:
+                        console.print(f"  • {change}")
+                        
+            except Exception as e:
+                error_msg = str(e)
+                # Check for authority errors (CPF0006, CPF22E2, CPF2292)
+                if any(code in error_msg for code in ["CPF0006", "CPF22E2", "CPF2292"]) or "authority" in error_msg.lower():
+                    if "CPF2292" in error_msg:
+                        console.print("[yellow]Current user lacks *SECADM (Security Administrator) special authority.[/yellow]")
+                        console.print("[dim]To modify users, you need a profile with *SECADM authority.[/dim]")
+                    else:
+                        console.print("[yellow]Current user lacks authority to modify users.[/yellow]")
+                    
+                    # Get admin credentials
+                    admin_conn = _get_elevated_connection(
+                        config, admin_user, admin_password, "*SECADM authority required"
+                    )
+                    
+                    if admin_conn:
+                        try:
+                            admin_user_mgr = UserManager(admin_conn)
+                            result = admin_user_mgr.modify_user(
+                                user,
+                                user_class=user_class,
+                                status=user_status,
+                                group_profile=group_profile,
+                                text_description=text_description
+                            )
+                            console.print(f"[green]User {user} modified successfully using elevated privileges[/green]")
+                            
+                            # Show what was changed
+                            if result.get("changes"):
+                                for change in result["changes"]:
+                                    console.print(f"  • {change}")
+                                    
+                            admin_conn.disconnect()
+                        except Exception as admin_e:
+                            admin_conn.disconnect()
+                            # Check if elevated user also lacks *SECADM
+                            admin_error = str(admin_e)
+                            if "CPF2292" in admin_error:
+                                console.print("[red]The administrative user also lacks *SECADM authority.[/red]")
+                                console.print("[dim]Hint: Verify the admin user has *SECADM special authority:[/dim]")
+                                console.print(f"[dim]  qadmcli sql execute -q \"SELECT AUTHORIZATION_NAME, SPECIAL_AUTHORITIES FROM QSYS2.USER_INFO WHERE AUTHORIZATION_NAME = '<admin_user>'\"[/dim]")
+                            raise admin_e
+                    else:
+                        console.print("[red]Operation cancelled. User not modified.[/red]")
+                        sys.exit(1)
+                else:
+                    raise
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("permission")
+@click.option("--user", "-u", required=True, help="Username")
+@click.option("--library", "-l", help="Filter by library")
+@click.pass_context
+def user_permission(
+    ctx: click.Context,
+    user: str,
+    library: str | None
+) -> None:
+    """List user permissions and authority."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            result = user_mgr.list_permissions(user, library)
+            
+            if output_format == "json":
+                print_json_clean(result)
+            else:
+                print_panel(
+                    ctx,
+                    Text.assemble(
+                        ("User: ", "bold"), user, "\n",
+                        ("User Class: ", "bold"), result.get("user_class", "N/A"), "\n",
+                        ("Group Profile: ", "bold"), result.get("group_profile", "None"), "\n",
+                        ("Special Authorities: ", "bold"), ", ".join(result.get("special_authorities", [])), "\n",
+                    ),
+                    title="User Permissions",
+                    border_style="blue"
+                )
+                
+                if result.get("object_authorities"):
+                    rows = []
+                    for auth in result["object_authorities"]:
+                        rows.append([
+                            auth.get("library", ""),
+                            auth.get("object", ""),
+                            auth.get("object_type", ""),
+                            auth.get("authority", "")
+                        ])
+                    console.print(print_table(
+                        console,
+                        ["Library", "Object", "Type", "Authority"],
+                        rows,
+                        title="Object Authorities"
+                    ))
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+def library() -> None:
+    """Library management commands."""
+    pass
+
+
+@library.command("create")
+@click.option("--name", "-n", required=True, help="Library name to create")
+@click.option("--user", "-u", help="User to grant authority to (optional)")
+@click.option("--authority", "-a", default="*ALL", help="Authority level to grant (*USE, *CHANGE, *ALL)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def library_create(
+    ctx: click.Context,
+    name: str,
+    user: str | None,
+    authority: str,
+    output_format: str
+) -> None:
+    """Create a new library and optionally grant user authority.
+    
+    Examples:
+        qadmcli library create -n NEWLIB
+        qadmcli library create -n NEWLIB -u USER001
+        qadmcli library create -n NEWLIB -u USER001 -a *CHANGE
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            # Create the library
+            result = user_mgr.create_library(name)
+            
+            # Grant authority if user specified
+            if user:
+                grant_result = user_mgr.grant_object_authority(
+                    user, name, name, authority, "*LIB"
+                )
+                result["granted_to"] = user
+                result["authority"] = authority
+            
+            if output_format == "json":
+                print_json_clean(result)
+            else:
+                print_panel(
+                    ctx,
+                    f"Library {name} created successfully",
+                    title="Library Created",
+                    border_style="green"
+                )
+                if user:
+                    console.print(f"Granted {authority} authority to {user}")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@library.command("grant")
+@click.option("--name", "-n", required=True, help="Library name")
+@click.option("--user", "-u", required=True, help="User to grant authority to")
+@click.option("--authority", "-a", default="*USE", help="Authority level (*USE, *CHANGE, *ALL)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def library_grant(
+    ctx: click.Context,
+    name: str,
+    user: str,
+    authority: str,
+    output_format: str
+) -> None:
+    """Grant authority to a user on a library.
+    
+    Examples:
+        qadmcli library grant -n MYLIB -u USER001
+        qadmcli library grant -n MYLIB -u USER001 -a *ALL
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from .db.user import UserManager
+            user_mgr = UserManager(conn)
+            
+            result = user_mgr.grant_object_authority(
+                user, name, name, authority, "*LIB"
+            )
+            
+            if output_format == "json":
+                print_json_clean(result)
+            else:
+                print_panel(
+                    ctx,
+                    f"Granted {authority} authority to {user} on library {name}",
+                    title="Authority Granted",
+                    border_style="green"
+                )
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+def mockup() -> None:
+    """Mockup data generation for testing.
+    
+    Generate realistic test data with automatic field pattern detection.
+    Supports INSERT/UPDATE/DELETE operations with customizable ratios.
+    
+    \b
+    Features:
+      - Automatic column type detection based on column names
+      - Realistic data generation (names, emails, phones, etc.)
+      - Customizable transaction mix (insert/update/delete ratios)
+      - Dry-run mode to preview SQL without executing
+      - Schema file support for custom column hints
+      - Composite primary key support
+      - Efficient handling of large tables (millions of rows)
+    
+    \b
+    Field Patterns (auto-detected from column names):
+      Names:        FIRST_NAME, LAST_NAME, FNAME, LNAME, SURNAME
+      Contact:      EMAIL, PHONE, MOBILE, TEL, CELL
+      Credit Card:  CREDIT_CARD, CREDITCARD, CC_NUMBER, CC_NO, CARD_NUMBER
+      Dates:        DATE, CREATED_DATE, UPDATED_DATE, BIRTHDAY
+      Money:        AMOUNT, PRICE, COST, FEE, TAX, BALANCE
+      IDs:          ID, CUST_ID, USER_ID, ORDER_ID, ACCOUNT_ID
+      Status:       STATUS, TYPE, ORDER_STATUS, STATE
+      Text:         CHAR, VARCHAR (fallback for unknown patterns)
+    
+    \b
+    Examples:
+      # Quick test - dry run 10 rows
+      qadmcli mockup generate -t CUSTOMERS -l MYLIB --dry-run -r 10
+      
+      # Generate 1000 rows with default ratios
+      qadmcli mockup generate -t ORDERS -l MYLIB -r 1000
+      
+      # Custom transaction mix
+      qadmcli mockup generate -t PRODUCTS -l MYLIB -r 500 \\
+          --insert-ratio 70 --update-ratio 20 --delete-ratio 10
+    
+    Notes:
+        - Table must have a primary key for UPDATE/DELETE operations
+        - Composite primary keys are fully supported
+        - Use --dry-run to preview SQL before executing
+    """
+    pass
+
+
+def _load_schema_hints(schema_path: str) -> tuple[dict[str, str], dict[str, Any]]:
+    """Load column hints and validation rules from a YAML schema file.
+
+    Returns a tuple of (hints dict, validation dict).
+    """
+    import yaml
+    import re
+
+    hints = {}
+    validation = {}
+    try:
+        with open(schema_path, 'r', encoding='utf-8') as f:
+            schema = yaml.safe_load(f)
+
+        if schema and 'columns' in schema:
+            for col in schema['columns']:
+                col_name = col.get('name')
+                description = col.get('description', '')
+
+                # Extract hint from description
+                if col_name and description:
+                    hint_match = re.search(r'\[hint:([^\]]+)\]', description, re.IGNORECASE)
+                    if hint_match:
+                        hints[col_name.upper()] = hint_match.group(1).strip()
+
+                # Build validation rules for this column
+                if col_name:
+                    validation[col_name.upper()] = {
+                        'type': col.get('type'),
+                        'length': col.get('length'),
+                        'scale': col.get('scale'),
+                        'nullable': col.get('nullable'),
+                    }
+
+    except Exception as e:
+        console.print(f"[yellow]Warning: Could not load schema from {schema_path}: {e}[/yellow]")
+
+    return hints, validation
+
+
+@mockup.command("generate")
+@click.option("--table", "-t", required=True, help="Table name (e.g., TB_02)")
+@click.option("--library", "-l", required=True, help="Library/schema name (e.g., EZPIPE)")
+@click.option("--schema", "-s", help="Schema YAML file for column hints and validation")
+@click.option("--skip-validation", is_flag=True, help="Skip schema validation when using --schema")
+@click.option("--number", "-r", default=1000, show_default=True, help="Number of rows/transactions to generate")
+@click.option("--insert-ratio", default=50, show_default=True, help="Percentage of INSERT operations (0-100)")
+@click.option("--update-ratio", default=30, show_default=True, help="Percentage of UPDATE operations (0-100)")
+@click.option("--delete-ratio", default=20, show_default=True, help="Percentage of DELETE operations (0-100)")
+@click.option("--batch-size", "-b", default=100, show_default=True, help="Number of operations per batch commit")
+@click.option("--dry-run", is_flag=True, help="Preview SQL statements without executing")
+@click.pass_context
+def mockup_generate(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    schema: Optional[str],
+    skip_validation: bool,
+    number: int,
+    insert_ratio: int,
+    update_ratio: int,
+    delete_ratio: int,
+    batch_size: int,
+    dry_run: bool
+) -> None:
+    """Generate mock data with INSERT/UPDATE/DELETE operations.
+
+    Generates realistic test data by automatically detecting field patterns based on column names.
+    Supports tables with single or composite primary keys.
+
+    \b
+    Field Patterns (auto-detected):
+        - first_name: FIRST_NAME, FNAME, FIRSTNAME
+        - last_name: LAST_NAME, LNAME, LASTNAME, SURNAME
+        - email: EMAIL, E_MAIL, MAIL
+        - phone: PHONE, MOBILE, TEL, CELL
+        - date: DATE, CREATED_DATE, UPDATED_DATE
+        - amount: AMOUNT, PRICE, COST, FEE, TAX
+        - id: ID, CUST_ID, USER_ID, ORDER_ID
+        - status: STATUS, TYPE, ORDER_STATUS
+        - string: CHAR, VARCHAR (default fallback)
+
+    \b
+    Examples:
+        # Dry run - preview SQL without executing
+        qadmcli mockup generate -t TB_02 -l EZPIPE --dry-run -r 10
+
+        # Generate 1000 transactions with default ratios (50% insert, 30% update, 20% delete)
+        qadmcli mockup generate -t CUSTOMERS -l MYLIB -r 1000
+
+        # Custom transaction mix - 60% inserts, 30% updates, 10% deletes
+        qadmcli mockup generate -t ORDERS -l MYLIB -r 500 \\
+            --insert-ratio 60 --update-ratio 30 --delete-ratio 10
+
+        # Use schema file for custom column hints
+        qadmcli mockup generate -t PRODUCTS -l MYLIB -s config/schema/products.yaml -n 100
+
+    \b
+    Notes:
+        - Ratios must sum to exactly 100
+        - Table must have a primary key for UPDATE/DELETE operations
+        - Composite primary keys are supported
+        - Large tables (millions of rows) are handled efficiently using sampling
+    """
+    config_path = ctx.obj["config_path"]
+
+    # Validate ratios
+    total_ratio = insert_ratio + update_ratio + delete_ratio
+    if total_ratio != 100:
+        console.print(f"[red]Error: Ratios must sum to 100, got {total_ratio}[/red]")
+        sys.exit(1)
+
+    try:
+        from .db.mockup import MockupManager, MockupConfig, SchemaValidationError
+
+        config = load_config(config_path)
+
+        mockup_config = MockupConfig(
+            insert_ratio=insert_ratio,
+            update_ratio=update_ratio,
+            delete_ratio=delete_ratio,
+            total_transactions=number,
+            batch_size=batch_size,
+            dry_run=dry_run
+        )
+
+        # Load schema hints and validation if provided
+        schema_hints = {}
+        schema_validation = {}
+        if schema:
+            schema_hints, schema_validation = _load_schema_hints(schema)
+            console.print(f"[blue]Loaded hints from schema: {schema}[/blue]")
+            if skip_validation:
+                console.print(f"[yellow]Schema validation skipped[/yellow]")
+                schema_validation = {}  # Clear validation rules
+
+        with AS400ConnectionManager(config) as conn:
+            mock_mgr = MockupManager(conn, schema_hints, schema_validation)
+
+            console.print(f"[blue]Generating mock data for {library}.{table}...[/blue]")
+            console.print(f"  Transactions: {number} (Insert: {insert_ratio}%, Update: {update_ratio}%, Delete: {delete_ratio}%)")
+            console.print(f"  Batch size: {batch_size}")
+            if dry_run:
+                console.print(f"  [yellow]Dry run mode - generating SQL only[/yellow]")
+
+            results = mock_mgr.generate_mock_data(table, library, mockup_config)
+            
+            if dry_run:
+                # Output SQL statements
+                sql_count = len(results["sql_statements"])
+                console.print(f"\n[green]Generated {sql_count} SQL statements:[/green]")
+                
+                # Show first 10 statements
+                for i, sql in enumerate(results["sql_statements"][:10]):
+                    console.print(sql)
+                
+                if sql_count > 10:
+                    console.print(f"\n... and {sql_count - 10} more statements")
+            else:
+                # Show statistics
+                stats = results["stats"]
+                console.print(f"\n[green]Mock data generation complete:[/green]")
+                console.print(f"  Inserted: {stats['inserted']} rows")
+                console.print(f"  Updated: {stats['updated']} rows")
+                console.print(f"  Deleted: {stats['deleted']} rows")
+
+    except SchemaValidationError as e:
+        console.print(f"[red]Schema validation error:[/red]")
+        console.print(f"[yellow]{e}[/yellow]")
+        console.print(f"\n[blue]Tip: Use --dry-run to preview without validation, or fix the table schema to match.[/blue]")
+        sys.exit(1)
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+def sql() -> None:
+    """SQL execution commands."""
+    pass
+
+
+@sql.command("execute")
+@click.option("--query", "-q", required=True, help="SQL query to execute")
+@click.option("-t", "--target", type=click.Choice(["as400", "mssql"]), default="as400", help="Target database (default: as400)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.option("--user", "-u", default=None, help="Override username for connection")
+@click.option("--password", "-p", default=None, help="Override password for connection")
+@click.pass_context
+def sql_execute(ctx: click.Context, query: str, target: str, output_format: str, user: str, password: str) -> None:
+    """Execute a SQL query and display results.
+    
+    Examples:
+        qadmcli sql execute -q "CREATE TABLE ..."              # AS400 (default)
+        qadmcli sql execute -q "CREATE TABLE ..." -t mssql     # MSSQL
+        qadmcli sql execute -q "DROP TABLE ..." --target mssql # MSSQL
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        # Warn about trailing semicolon for AS400 (DB2 for i doesn't accept it in JDBC)
+        if target == "as400" and query.rstrip().endswith(';'):
+            console.print("[yellow]Warning: Trailing semicolon detected. DB2 for i JDBC driver may reject it. Consider removing the ';'.[/yellow]")
+        
+        if target == "mssql":
+            # Execute on MSSQL
+            if not config.mssql:
+                console.print("[red]Error: MSSQL configuration not found[/red]")
+                sys.exit(1)
+            
+            from .db.mssql import MSSQLConnection
+            
+            # Apply credential overrides if provided
+            mssql_config = config.mssql
+            if user or password:
+                mssql_config = config.mssql.copy_with_overrides(username=user, password=password)
+                if output_format != "json":  # Suppress in JSON mode
+                    console.print(f"[yellow]Using credential override: user={user or '***'}[/yellow]")
+            
+            if output_format != "json":  # Suppress in JSON mode
+                console.print(f"[dim]Executing on MSSQL: {query[:80]}...[/dim]")
+            
+            with MSSQLConnection(mssql_config) as conn:
+                with conn.get_cursor() as cursor:
+                    cursor.execute(query)
+                    
+                    # Check if query returns results (SELECT)
+                    if query.strip().upper().startswith("SELECT"):
+                        rows = cursor.fetchall()
+                        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                        
+                        if output_format == "json":
+                            import json
+                            results = []
+                            for row in rows:
+                                row_dict = {}
+                                for i, col in enumerate(columns):
+                                    row_dict[str(col)] = row[i]
+                                results.append(row_dict)
+                            console.print(json.dumps(results, indent=2, default=str))
+                        else:
+                            console.print(f"[green]✓ Query executed successfully ({len(rows)} rows)[/green]")
+                            if rows:
+                                console.print(f"[dim]First 10 rows:[/dim]")
+                                for row in rows[:10]:
+                                    console.print(f"  {row}")
+                    else:
+                        # DDL/DML query (CREATE, INSERT, UPDATE, DELETE)
+                        row_count = cursor.rowcount
+                        if output_format == "json":
+                            import json
+                            console.print(json.dumps({"status": "success", "rows_affected": row_count}))
+                        else:
+                            console.print(f"[green]✓ Query executed successfully ({row_count} rows affected)[/green]")
+        else:
+            # Execute on AS400 (default)
+            # Apply credential overrides if provided
+            as400_config = config.as400
+            if user or password:
+                as400_config = config.as400.copy_with_overrides(user=user, password=password)
+                if output_format != "json":  # Suppress in JSON mode
+                    console.print(f"[yellow]Using credential override: user={user or '***'}[/yellow]")
+            
+            # Create temporary config with overridden AS400 settings
+            from copy import deepcopy
+            temp_config = deepcopy(config)
+            temp_config.as400 = as400_config
+            
+            if output_format != "json":  # Suppress in JSON mode
+                console.print(f"[dim]Executing on AS400: {query[:80]}...[/dim]")
+            
+            with AS400ConnectionManager(temp_config) as conn:
+                cursor = conn.execute(query)
+                
+                # Check if query returns results (SELECT)
+                if query.strip().upper().startswith("SELECT"):
+                    # Get column names
+                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                    
+                    # Fetch all rows
+                    rows = cursor.fetchall()
+                    cursor.close()
+                    
+                    if output_format == "json":
+                        # Clean JSON output for scripts (no Rich formatting)
+                        from .utils.formatters import print_json_clean
+                        results = []
+                        for row in rows:
+                            row_dict = {}
+                            for i, col in enumerate(columns):
+                                row_dict[str(col)] = row[i]
+                            results.append(row_dict)
+                        print_json_clean(results)
+                    else:
+                        # Format as table
+                        if rows:
+                            table_rows = []
+                            for row in rows:
+                                table_rows.append([str(cell) if cell is not None else "NULL" for cell in row])
+                            
+                            # Sanitize column names for Windows terminal compatibility
+                            def sanitize_column(name: str) -> str:
+                                """Sanitize column name for Windows terminal display."""
+                                sanitized = str(name)
+                                replacements = {
+                                    '\u2026': '...',
+                                    '\u2018': "'",
+                                    '\u2019': "'",
+                                    '\u201C': '"',
+                                    '\u201D': '"',
+                                    '\u2013': '-',
+                                    '\u2014': '--',
+                                }
+                                for unicode_char, ascii_char in replacements.items():
+                                    sanitized = sanitized.replace(unicode_char, ascii_char)
+                                if len(sanitized) > 30:
+                                    sanitized = sanitized[:27] + '...'
+                                return sanitized
+                            
+                            str_columns = [sanitize_column(str(col)) for col in columns]
+                            console.print(print_table(
+                                console,
+                                str_columns,
+                                table_rows,
+                                title="Query Results"
+                            ))
+                            console.print(f"[green]{len(rows)} row(s) returned[/green]")
+                        else:
+                            console.print("[yellow]No rows returned[/yellow]")
+                else:
+                    # DDL/DML query (CREATE, ALTER, INSERT, UPDATE, DELETE)
+                    row_count = cursor.rowcount if cursor.rowcount >= 0 else 0
+                    cursor.close()
+                    
+                    if output_format == "json":
+                        import json
+                        console.print(json.dumps({"status": "success", "rows_affected": row_count}))
+                    else:
+                        console.print(f"[green]✓ Query executed successfully ({row_count} rows affected)[/green]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        # Enhanced error reporting - show exception type and details
+        error_msg = str(e) if str(e) else "(empty error message)"
+        error_type = type(e).__name__
+        console.print(f"[red]Error [{error_type}]: {error_msg}[/red]")
+        
+        # Show traceback in verbose mode (for debugging)
+        import os
+        if os.environ.get('QADMCLI_DEBUG') == '1':
+            import traceback
+            console.print(f"[dim]Traceback:[/dim]")
+            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        
+        sys.exit(1)
+
+
+@sql.command("query")
+@click.option("--query", "-q", required=True, help="SQL SELECT query to execute")
+@click.option("--target", "-t", type=click.Choice(["as400", "mssql"]), default="as400", help="Target database (default: as400)")
+@click.option("--limit", "-l", type=int, default=100, help="Maximum rows to return (default: 100)")
+@click.option("--offset", "-o", type=int, default=0, help="Number of rows to skip (default: 0)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "csv", "json"]), default="table", help="Output format")
+@click.option("--user", "-u", default=None, help="Override username for connection")
+@click.option("--password", "-p", default=None, help="Override password for connection")
+@click.pass_context
+def sql_query(ctx: click.Context, query: str, target: str, limit: int, offset: int, output_format: str, user: str, password: str) -> None:
+    """Execute a SELECT query with formatted output and pagination.
+    
+    Examples:
+        qadmcli sql query -q "SELECT * FROM GSLIBTST.CUSTOMERS"
+        qadmcli sql query -q "SELECT * FROM dbo.CUSTOMERS" --target mssql
+        qadmcli sql query -q "SELECT * FROM GSLIBTST.CUSTOMERS" --limit 10 --offset 20
+        qadmcli sql query -q "SELECT * FROM GSLIBTST.CUSTOMERS" --format csv
+        qadmcli sql query -q "SELECT CUST_ID, FIRST_NAME, EMAIL FROM GSLIBTST.CUSTOMERS WHERE STATUS = 'ACTIVE'"
+    """
+    config_path = ctx.obj["config_path"]
+    border_style = ctx.obj.get("border_style", "unicode")
+    
+    try:
+        config = load_config(config_path)
+        
+        # Validate query is a SELECT
+        query_stripped = query.strip().upper()
+        if not query_stripped.startswith("SELECT"):
+            console.print("[red]Error: Only SELECT queries are allowed. Use 'sql execute' for other SQL commands.[/red]")
+            sys.exit(1)
+        
+        # Warn about trailing semicolon (DB2 for i doesn't accept it in JDBC)
+        if target == "as400" and query.rstrip().endswith(';'):
+            if output_format != "json":  # Suppress in JSON mode
+                console.print("[yellow]Warning: Trailing semicolon detected. DB2 for i JDBC driver may reject it. Consider removing the ';'.[/yellow]")
+        
+        # Use appropriate connection based on target
+        if target == "mssql":
+            from .db.mssql import MSSQLConnection
+            if not config.mssql:
+                console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+                sys.exit(1)
+            # Apply credential overrides if provided
+            mssql_config = config.mssql
+            if user or password:
+                mssql_config = config.mssql.copy_with_overrides(username=user, password=password)
+                if output_format != "json":  # Suppress in JSON mode
+                    console.print(f"[yellow]Using credential override: user={user or '***'}[/yellow]")
+            conn_manager = MSSQLConnection(mssql_config)
+            conn_manager.connect()
+        else:
+            from .db.connection import AS400ConnectionManager
+            # Apply credential overrides if provided
+            as400_config = config.as400
+            if user or password:
+                as400_config = config.as400.copy_with_overrides(user=user, password=password)
+                if output_format != "json":  # Suppress in JSON mode
+                    console.print(f"[yellow]Using credential override: user={user or '***'}[/yellow]")
+            # Create temporary config with overridden AS400 settings
+            from copy import deepcopy
+            temp_config = deepcopy(config)
+            temp_config.as400 = as400_config
+            conn_manager = AS400ConnectionManager(temp_config)
+            conn_manager.connect()
+        
+        try:
+            # Add pagination if not already present
+            paginated_query = query
+            if target == "mssql":
+                # MSSQL uses TOP syntax for simple pagination
+                # Note: OFFSET/FETCH requires ORDER BY, so we only use TOP
+                if "TOP" not in query_stripped and "OFFSET" not in query_stripped:
+                    # Insert TOP after SELECT
+                    query_upper = query.upper()
+                    select_pos = query_upper.find("SELECT")
+                    if select_pos >= 0:
+                        # Insert TOP after SELECT
+                        paginated_query = query[:select_pos + 6] + f" TOP {limit}" + query[select_pos + 6:]
+            else:
+                # DB2/AS400 syntax
+                if "FETCH FIRST" not in query_stripped and "LIMIT" not in query_stripped:
+                    if "OFFSET" not in query_stripped:
+                        paginated_query = f"{query} OFFSET {offset} ROWS FETCH FIRST {limit} ROWS ONLY"
+            
+            # Get the appropriate cursor/connection
+            if target == "mssql":
+                cursor = conn_manager._connection.cursor()
+                cursor.execute(paginated_query)
+            else:
+                cursor = conn_manager.execute(paginated_query)
+            
+            # Get column names
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            
+            # Fetch all rows
+            rows = cursor.fetchall()
+            cursor.close()
+            
+            if not rows:
+                console.print("[yellow]No rows returned[/yellow]")
+                return
+            
+            # Convert rows to list of lists for easier handling
+            table_data = []
+            for row in rows:
+                table_data.append([str(cell) if cell is not None else "NULL" for cell in row])
+            
+            # Output based on format
+            if output_format == "json":
+                # Clean JSON output for scripts (no Rich formatting)
+                from .utils.formatters import print_json_clean
+                results = []
+                for row in rows:
+                    row_dict = {}
+                    for i, col in enumerate(columns):
+                        row_dict[str(col)] = row[i]
+                    results.append(row_dict)
+                print_json_clean(results)
+            elif output_format == "csv":
+                # CSV output
+                import csv
+                import io
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(columns)
+                writer.writerows(table_data)
+                console.print(output.getvalue())
+            else:
+                # Table output
+                # Sanitize column names for Windows terminal compatibility
+                def sanitize_column(name: str) -> str:
+                    sanitized = str(name)
+                    replacements = {
+                        '\u2026': '...',
+                        '\u2018': "'",
+                        '\u2019': "'",
+                        '\u201C': '"',
+                        '\u201D': '"',
+                        '\u2013': '-',
+                        '\u2014': '--',
+                    }
+                    for unicode_char, ascii_char in replacements.items():
+                        sanitized = sanitized.replace(unicode_char, ascii_char)
+                    if len(sanitized) > 30:
+                        sanitized = sanitized[:27] + '...'
+                    return sanitized
+                
+                str_columns = [sanitize_column(str(col)) for col in columns]
+                
+                # Use ASCII border style if requested
+                if border_style == "ascii":
+                    from .utils.formatters import print_table as format_table
+                    console.print(format_table(
+                        console,
+                        str_columns,
+                        table_data,
+                        title=f"Query Results ({len(rows)} rows)"
+                    ))
+                else:
+                    from rich.table import Table as RichTable
+                    table = RichTable(title=f"Query Results ({len(rows)} rows)", show_header=True, header_style="bold magenta")
+                    for col in str_columns:
+                        table.add_column(col)
+                    for row in table_data[:limit]:
+                        table.add_row(*row)
+                    console.print(table)
+                
+                console.print(f"[green]{len(rows)} row(s) returned[/green]")
+                if len(rows) == limit:
+                    console.print(f"[dim]Use --offset {offset + limit} to see more rows[/dim]")
+        
+        finally:
+            # Always close connection
+            conn_manager.disconnect()
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+def mssql() -> None:
+    """MSSQL-specific commands."""
+    pass
+
+
+@mssql.command("test")
+@click.option("-U", "--username", help="Test connection with specific username (admin user)")
+@click.option("-P", "--password", help="Password for the specified username")
+@click.pass_context
+def mssql_test(ctx: click.Context, username: str | None, password: str | None) -> None:
+    """Test connection to MSSQL database.
+    
+    Examples:
+        qadmcli mssql test                          # Test with default user from config
+        qadmcli mssql test -U sa                    # Test with admin user (prompts for password)
+        qadmcli mssql test -U sa -P 'your_password' # Test with admin user and password
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .models.connection import MSSQLConnection as MSSQLConnectionModel
+        
+        # Override credentials if provided
+        test_config = config.mssql
+        if username:
+            if not password:
+                import getpass
+                password = getpass.getpass(f"Password for {username}: ")
+            
+            console.print(f"[dim]Testing connection as user: {username}[/dim]")
+            
+            # Create temporary config with override credentials
+            test_config = MSSQLConnectionModel(
+                host=config.mssql.host,
+                port=config.mssql.port,
+                username=username,
+                password=password,
+                database=config.mssql.database,
+            )
+        
+        console.print(f"[dim]Testing connection to MSSQL: {test_config.host}:{test_config.port}...[/dim]")
+        
+        with MSSQLConnection(test_config) as conn:
+            # Get server info
+            with conn.get_cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        @@VERSION as version,
+                        DB_NAME() as database_name,
+                        @@SERVERNAME as server_name,
+                        GETDATE() as server_time
+                """)
+                row = cursor.fetchone()
+                
+                if output_format == "json":
+                    import json
+                    result = {
+                        "host": test_config.host,
+                        "port": test_config.port,
+                        "user": test_config.username,
+                        "database": row[1],
+                        "server": row[2],
+                        "version": row[0].split('\n')[0] if row[0] else None,
+                        "status": "connected"
+                    }
+                    console.print(json.dumps(result, indent=2))
+                else:
+                    # Display in panel
+                    from rich.panel import Panel
+                    
+                    version_short = row[0].split('\n')[0] if row[0] else "Unknown"
+                    
+                    info_lines = [
+                        f"[cyan]Host:[/cyan] {test_config.host}:{test_config.port}",
+                        f"[cyan]User:[/cyan] {test_config.username}",
+                        f"[cyan]Database:[/cyan] {row[1]}",
+                        f"[cyan]Server:[/cyan] {row[2]}",
+                        f"[cyan]Version:[/cyan] {version_short}",
+                        f"[cyan]Status:[/cyan] [green]Connected[/green]",
+                    ]
+                    
+                    console.print(Panel(
+                        "\n".join(info_lines),
+                        title="[bold green]MSSQL Connection Test[/bold green]",
+                        border_style="green"
+                    ))
+    
+    except Exception as e:
+        if output_format == "json":
+            import json
+            console.print(json.dumps({"status": "error", "error": str(e)}))
+        else:
+            console.print(f"[red]Connection failed: {e}[/red]")
+        sys.exit(1)
+
+
+@mssql.command("query")
+@click.option("--query", "-q", required=True, help="SQL SELECT query to execute")
+@click.option("--limit", "-l", type=int, default=100, help="Maximum rows to return (default: 100)")
+@click.option("--offset", "-o", type=int, default=0, help="Number of rows to skip (default: 0)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "csv", "json"]), default="table", help="Output format")
+@click.option("--user", "-u", default=None, help="Override username for connection")
+@click.option("--password", "-p", default=None, help="Override password for connection")
+@click.pass_context
+def mssql_query(ctx: click.Context, query: str, limit: int, offset: int, output_format: str, user: str, password: str) -> None:
+    """Execute a SELECT query on MSSQL database.
+    
+    This is a convenience alias for 'sql query --target mssql'.
+    
+    Examples:
+        qadmcli mssql query -q "SELECT * FROM dbo.CUSTOMERS"
+        qadmcli mssql query -q "SELECT * FROM dbo.CUSTOMERS" --limit 10
+        qadmcli mssql query -q "SELECT * FROM dbo.CUSTOMERS" --format json
+        qadmcli mssql query -q "SELECT * FROM dbo.CUSTOMERS" -u GLUESYNC01 -p password123
+    """
+    # Delegate to sql_query with target=mssql
+    ctx.invoke(sql_query, query=query, target="mssql", limit=limit, offset=offset, output_format=output_format, user=user, password=password)
+
+
+@mssql.command("execute")
+@click.option("--query", "-q", required=True, help="SQL query to execute (DDL/DML)")
+@click.option("--user", "-u", default=None, help="Override username for connection")
+@click.option("--password", "-p", default=None, help="Override password for connection")
+@click.pass_context
+def mssql_execute(ctx: click.Context, query: str, user: str, password: str) -> None:
+    """Execute a SQL query on MSSQL database (DDL/DML).
+    
+    Use this for CREATE, ALTER, DROP, INSERT, UPDATE, DELETE operations.
+    For SELECT queries, use 'mssql query' instead.
+    
+    Examples:
+        qadmcli mssql execute -q "CREATE TABLE dbo.TEST (ID INT)"
+        qadmcli mssql execute -q "INSERT INTO dbo.CUSTOMERS VALUES (1, 'John')"
+        qadmcli mssql execute -q "UPDATE dbo.CUSTOMERS SET STATUS='ACTIVE'"
+        qadmcli mssql execute -q "DROP TABLE dbo.TEST"
+        qadmcli mssql execute -q "GRANT SELECT ON dbo.CUSTOMERS TO GLUESYNC01" -u sa -p password
+    """
+    # Delegate to sql_execute with target=mssql
+    ctx.invoke(sql_execute, query=query, target="mssql", user=user, password=password)
+
+
+@mssql.group()
+def user() -> None:
+    """MSSQL user management commands."""
+    pass
+
+
+@user.command("check")
+@click.option("--user", "-u", required=True, help="Username to check")
+@click.pass_context
+def mssql_user_check(ctx: click.Context, user: str) -> None:
+    """Check if user exists in MSSQL and get permissions.
+    
+    Shows server login, database user, roles, and explicit permissions.
+    
+    Examples:
+        qadmcli mssql user check -u GLUESYNC01
+        qadmcli mssql user check -u myuser
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_user import MSSQLUserManager
+        
+        mssql_conn = MSSQLConnection(config.mssql)
+        mssql_conn.connect()
+        
+        try:
+            user_mgr = MSSQLUserManager(mssql_conn)
+            result = user_mgr.check_user(user)
+            
+            if output_format == "json":
+                print_json_clean(result)
+            else:
+                print_panel(
+                    ctx,
+                    f"Checking user: {user}",
+                    title="MSSQL User Check",
+                    border_style="blue"
+                )
+                
+                # Server Login Info
+                if result["server_login_exists"]:
+                    login_info = result["server_login_info"]
+                    login_rows = [
+                        ["Name", login_info["name"]],
+                        ["Type", login_info["type"]],
+                        ["Disabled", "Yes" if login_info["is_disabled"] else "No"],
+                        ["Default Database", login_info["default_database"] or "N/A"],
+                        ["Created", login_info["create_date"] or "N/A"]
+                    ]
+                    console.print(print_table(
+                        console,
+                        ["Property", "Value"],
+                        login_rows,
+                        title="Server Login"
+                    ))
+                    
+                    # Server Roles
+                    if result["server_roles"]:
+                        roles_text = ", ".join(result["server_roles"])
+                        console.print(f"[green]Server Roles: {roles_text}[/green]")
+                    else:
+                        console.print("[yellow]No server roles assigned[/yellow]")
+                else:
+                    console.print("[red]✗ Server login does not exist[/red]")
+                
+                # Login-to-User Mapping
+                if result["mapped_database_user"]:
+                    mapping = result["mapped_database_user"]
+                    map_rows = [
+                        ["Server Login", mapping["login_name"]],
+                        ["Database User", mapping["database_user_name"]],
+                        ["User Type", mapping["user_type"]],
+                        ["Default Schema", mapping["default_schema"] or "N/A"]
+                    ]
+                    console.print(print_table(
+                        console,
+                        ["Property", "Value"],
+                        map_rows,
+                        title="Login-to-User Mapping"
+                    ))
+                elif result["server_login_exists"] and not result["database_user_exists"]:
+                    console.print(f"[yellow]⚠ Login '{user}' is not mapped to any database user in current database[/yellow]")
+                
+                # Database User Info
+                if result["database_user_exists"]:
+                    db_info = result["database_user_info"]
+                    db_rows = [
+                        ["Name", db_info["name"]],
+                        ["Type", db_info["type"]],
+                        ["Default Schema", db_info["default_schema"] or "N/A"],
+                        ["Created", db_info["create_date"] or "N/A"]
+                    ]
+                    console.print(print_table(
+                        console,
+                        ["Property", "Value"],
+                        db_rows,
+                        title="Database User"
+                    ))
+                    
+                    # Database Roles
+                    if result["database_roles"]:
+                        roles_text = ", ".join(result["database_roles"])
+                        console.print(f"[green]Database Roles: {roles_text}[/green]")
+                    else:
+                        console.print("[yellow]No database roles assigned[/yellow]")
+                    
+                    # Explicit Permissions
+                    if result["explicit_permissions"]:
+                        perm_rows = []
+                        for perm in result["explicit_permissions"]:
+                            perm_rows.append([
+                                perm["permission"],
+                                perm["state"],
+                                f"{perm['schema_name']}.{perm['object_name']}" if perm["object_name"] else perm["class"],
+                            ])
+                        console.print(print_table(
+                            console,
+                            ["Permission", "State", "Object"],
+                            perm_rows,
+                            title="Explicit Permissions"
+                        ))
+                    else:
+                        console.print("[yellow]No explicit permissions found[/yellow]")
+                else:
+                    console.print("[red]✗ Database user does not exist[/red]")
+                
+                # Summary
+                if result["server_login_exists"] and result["database_user_exists"]:
+                    console.print("\n[green]✓ User is fully configured (login + database user)[/green]")
+                elif result["server_login_exists"]:
+                    console.print("\n[yellow]⚠ Server login exists but database user is missing[/yellow]")
+                    console.print("[dim]Run: CREATE USER [username] FROM LOGIN [username][/dim]")
+                else:
+                    console.print("\n[red]✗ User does not exist. Create login first:[/red]")
+                    console.print(f"[dim]CREATE LOGIN [{user}] WITH PASSWORD = 'password'[/dim]".replace('[', '\\[').replace(']', '\\]'))
+        
+        finally:
+            mssql_conn.disconnect()
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("check-table")
+@click.option("--user", "-u", required=True, help="Username to check")
+@click.option("--table", "-t", required=True, help="Table name to check")
+@click.option("--schema", "-s", default="dbo", show_default=True, help="Schema name")
+@click.pass_context
+def mssql_user_check_table(ctx: click.Context, user: str, table: str, schema: str) -> None:
+    """Check user permissions for a specific table.
+    
+    Shows effective permissions, role permissions, and public permissions.
+    
+    Examples:
+        qadmcli mssql user check-table -u GLUESYNC01 -t CUSTOMERS
+        qadmcli mssql user check-table -u GLUESYNC01 -t CUSTOMERS -s dbo
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_user import MSSQLUserManager
+        
+        mssql_conn = MSSQLConnection(config.mssql)
+        mssql_conn.connect()
+        
+        try:
+            user_mgr = MSSQLUserManager(mssql_conn)
+            result = user_mgr.check_table_permissions(user, table, schema)
+            
+            if output_format == "json":
+                print_json_clean(result)
+            else:
+                print_panel(
+                    ctx,
+                    f"Checking permissions for {user} on {schema}.{table}",
+                    title="MSSQL Table Permission Check",
+                    border_style="blue"
+                )
+                
+                # Table existence
+                if result["table_exists"]:
+                    console.print(f"[green]✓ Table {schema}.{table} exists[/green]")
+                else:
+                    console.print(f"[red]✗ Table {schema}.{table} does not exist[/red]")
+                    return
+                
+                # Server login status
+                if result["server_login_exists"]:
+                    console.print(f"[green]✓ Server login: {user}[/green]")
+                else:
+                    console.print(f"[red]✗ Server login: {user} does not exist[/red]")
+                    return
+                
+                # Show login-to-user mapping
+                if result["mapped_database_user"]:
+                    mapping = result["mapped_database_user"]
+                    console.print(f"[green]✓ Mapped to database user: {mapping['database_user_name']} (type: {mapping['user_type']})[/green]")
+                    effective_user = mapping["database_user_name"]
+                elif result["database_user_exists"]:
+                    console.print(f"[green]✓ Database user: {user} (explicit)[/green]")
+                    effective_user = user
+                else:
+                    console.print(f"[yellow]⚠ No database user mapping found[/yellow]")
+                    console.print(f"[dim]Login '{user}' is not mapped to any user in this database[/dim]")
+                    effective_user = user
+                
+                # Special roles
+                if result["is_sysadmin"]:
+                    console.print(f"[green]✓ Server role: sysadmin (full access to all databases)[/green]")
+                
+                if result["is_db_owner"]:
+                    console.print(f"[green]✓ Database role: db_owner (full access to this database)[/green]")
+                
+                if result["has_db_datareader"]:
+                    console.print(f"[green]✓ Database role: db_datareader (can SELECT from all tables)[/green]")
+                
+                if result["has_db_datawriter"]:
+                    console.print(f"[green]✓ Database role: db_datawriter (can INSERT/UPDATE/DELETE all tables)[/green]")
+                
+                if result["has_db_ddladmin"]:
+                    console.print(f"[green]✓ Database role: db_ddladmin (can modify schema)[/green]")
+                
+                if result["has_db_securityadmin"]:
+                    console.print(f"[green]✓ Database role: db_securityadmin (can manage permissions)[/green]")
+                
+                if result["has_db_backupoperator"]:
+                    console.print(f"[green]✓ Database role: db_backupoperator (can backup database)[/green]")
+                
+                # Show all database roles
+                if result["database_roles"]:
+                    roles_text = ", ".join(result["database_roles"])
+                    console.print(f"\n[dim]All database roles: {roles_text}[/dim]")
+                
+                # Effective permissions
+                if result["effective_permissions"]:
+                    eff_rows = []
+                    for perm in result["effective_permissions"]:
+                        eff_rows.append([perm["permission"], perm["state"]])
+                    console.print(print_table(
+                        console,
+                        ["Permission", "State"],
+                        eff_rows,
+                        title=f"Effective Permissions (as {effective_user})"
+                    ))
+                else:
+                    if not result["database_user_exists"] and not result["mapped_database_user"]:
+                        console.print(f"[yellow]⚠ Cannot check effective permissions (login '{user}' has no database user mapping)[/yellow]")
+                        console.print("[dim]User may still have access through guest account or other mechanisms[/dim]")
+                    else:
+                        console.print(f"[yellow]No effective permissions on this table (checked as {effective_user})[/yellow]")
+                
+                # Explicit permissions
+                if result["role_permissions"]:
+                    role_rows = []
+                    for perm in result["role_permissions"]:
+                        role_rows.append([perm["permission"], perm["state"], perm["grantee"]])
+                    console.print(print_table(
+                        console,
+                        ["Permission", "State", "Grantee"],
+                        role_rows,
+                        title=f"Explicit Permissions (for {effective_user})"
+                    ))
+                
+                # Public permissions
+                if result["public_permissions"]:
+                    pub_rows = []
+                    for perm in result["public_permissions"]:
+                        pub_rows.append([perm["permission"], perm["state"]])
+                    console.print(print_table(
+                        console,
+                        ["Permission", "State"],
+                        pub_rows,
+                        title="Public Permissions"
+                    ))
+                
+                # Summary
+                has_select = any(p["permission"] == "SELECT" for p in result["effective_permissions"])
+                has_full_access = (result["is_sysadmin"] or 
+                                 result["is_db_owner"] or 
+                                 result["has_db_datareader"])
+                
+                if has_select or has_full_access:
+                    console.print("\n[green]✓ User can SELECT from this table[/green]")
+                    if has_full_access:
+                        reasons = []
+                        if result["is_sysadmin"]:
+                            reasons.append("sysadmin")
+                        if result["is_db_owner"]:
+                            reasons.append("db_owner")
+                        if result["has_db_datareader"]:
+                            reasons.append("db_datareader")
+                        console.print(f"[dim](Access via role: {', '.join(reasons)})[/dim]")
+                else:
+                    console.print("\n[red]✗ User cannot SELECT from this table[/red]")
+        
+        finally:
+            mssql_conn.disconnect()
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@user.command("grant")
+@click.option("--user", "-u", required=True, help="Username to grant permission to")
+@click.option("--permission", "-p", required=True, help="Permission to grant (e.g., SELECT, INSERT, UPDATE, DELETE, ALL)")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--schema", "-s", default="dbo", show_default=True, help="Schema name")
+@click.pass_context
+def mssql_user_grant(ctx: click.Context, user: str, permission: str, table: str, schema: str) -> None:
+    """Grant permission to user on a table.
+    
+    Automatically creates database user from login if it doesn't exist.
+    
+    Examples:
+        qadmcli mssql user grant -u GLUESYNC01 -p SELECT -t CUSTOMERS
+        qadmcli mssql user grant -u GLUESYNC01 -p SELECT,INSERT,UPDATE -t CUSTOMERS -s dbo
+        qadmcli mssql user grant -u GLUESYNC01 -p ALL -t ORDERS
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_user import MSSQLUserManager
+        
+        mssql_conn = MSSQLConnection(config.mssql)
+        mssql_conn.connect()
+        
+        try:
+            user_mgr = MSSQLUserManager(mssql_conn)
+            
+            # Handle multiple permissions (comma-separated)
+            permissions = [p.strip() for p in permission.split(",")]
+            
+            results = []
+            for perm in permissions:
+                result = user_mgr.grant_permission(user, perm, table, "TABLE", schema)
+                results.append(result)
+                
+                if result["success"]:
+                    console.print(f"[green]✓ Granted {perm} on {schema}.{table} to {user}[/green]")
+                    console.print(f"[dim]SQL: {result['sql_executed']}[/dim]")
+                else:
+                    console.print(f"[red]✗ Failed to grant {perm}: {result['error']}[/red]")
+            
+            success_count = sum(1 for r in results if r["success"])
+            console.print(f"\n{success_count}/{len(results)} permission(s) granted successfully")
+        
+        finally:
+            mssql_conn.disconnect()
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@mssql.group()
+def ct() -> None:
+    """MSSQL Change Tracking commands."""
+    pass
+
+
+@ct.command("status")
+@click.option("--table", "-t", required=True, help="Table name (e.g., CUSTOMERS)")
+@click.option("--schema", "-s", default="dbo", show_default=True, help="Schema name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format")
+@click.pass_context
+def mssql_ct_status(ctx: click.Context, table: str, schema: str, output_format: str) -> None:
+    """Check if Change Tracking is enabled on database and table.
+    
+    Examples:
+        qadmcli mssql ct status -t CUSTOMERS
+        qadmcli mssql ct status -t CUSTOMERS -s dbo
+        qadmcli mssql ct status -t CUSTOMERS -s dbo --format json
+    """
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output
+    if output_format == "json":
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_ct import MSSQLChangeTracking
+        
+        with MSSQLConnection(config.mssql) as conn:
+            ct = MSSQLChangeTracking(conn)
+            status = ct.get_table_ct_status(table, schema)
+            
+            if output_format == "json":
+                # JSON output for scripting
+                from .utils.formatters import print_json_clean
+                print_json_clean({
+                    "table": f"{schema}.{table}",
+                    "database": status.database_name,
+                    "ct_enabled_on_database": status.is_enabled_on_database,
+                    "ct_enabled_on_table": status.is_enabled_on_table,
+                    "retention_period_days": status.retention_period_days,
+                    "auto_cleanup": status.auto_cleanup
+                })
+            else:
+                # Human-readable output
+                console.print(f"[bold]Change Tracking Status for {schema}.{table}[/bold]")
+                console.print(f"  Database: {status.database_name}")
+                console.print(f"  CT Enabled on Database: {'[green]Yes[/green]' if status.is_enabled_on_database else '[red]No[/red]'}")
+                
+                if status.is_enabled_on_database:
+                    console.print(f"  CT Enabled on Table: {'[green]Yes[/green]' if status.is_enabled_on_table else '[red]No[/red]'}")
+                    console.print(f"  Retention Period: {status.retention_period_days} days" if status.retention_period_days else "  Retention Period: N/A")
+                    console.print(f"  Auto Cleanup: {'Yes' if status.auto_cleanup else 'No'}" if status.auto_cleanup is not None else "  Auto Cleanup: N/A")
+                
+                if not status.is_enabled_on_database:
+                    console.print("\n[yellow]To enable CT on database:[/yellow]")
+                    console.print(f"  ALTER DATABASE [{status.database_name}] SET CHANGE_TRACKING = ON")
+                    console.print("  (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON)")
+                elif not status.is_enabled_on_table:
+                    console.print("\n[yellow]To enable CT on table:[/yellow]")
+                    console.print(f"  ALTER TABLE [{schema}].[{table}] ENABLE CHANGE_TRACKING")
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@ct.command("changes")
+@click.option("--table", "-t", required=True, help="Table name (e.g., CUSTOMERS)")
+@click.option("--schema", "-s", default="dbo", show_default=True, help="Schema name")
+@click.option("--since", help="Get changes since timestamp (YYYY-MM-DD HH:MM:SS)")
+@click.option("--since-version", type=int, help="Get changes since specific version")
+@click.option("--limit", "-l", type=int, default=1000, help="Maximum changes to return (default: 1000)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json", "summary"]), default="table", help="Output format")
+@click.pass_context
+def mssql_ct_changes(
+    ctx: click.Context,
+    table: str,
+    schema: str,
+    since: Optional[str],
+    since_version: Optional[int],
+    limit: int,
+    output_format: str
+) -> None:
+    """Get Change Tracking changes for a table.
+    
+    Returns:
+        SYS_CHANGE_VERSION, SYS_CHANGE_OPERATION (I/U/D), Primary Key values,
+        SYS_CHANGE_CONTEXT (if available)
+    
+    Use --format summary for operation counts only (useful for comparison with AS400 journal).
+    
+    Examples:
+        qadmcli mssql ct changes -t CUSTOMERS --since "2025-04-09 10:00:00"
+        qadmcli mssql ct changes -t CUSTOMERS --since-version 12345
+        qadmcli mssql ct changes -t CUSTOMERS --since "2025-04-09" --format summary
+        qadmcli mssql ct changes -t CUSTOMERS --format json
+    """
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON/summary output
+    if output_format in ("json", "summary"):
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_ct import MSSQLChangeTracking
+        
+        # Parse timestamp if provided
+        since_timestamp = None
+        if since:
+            try:
+                since_timestamp = datetime.strptime(since, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                try:
+                    since_timestamp = datetime.strptime(since, "%Y-%m-%d")
+                except ValueError:
+                    console.print("[red]Error: Invalid timestamp format. Use YYYY-MM-DD HH:MM:SS or YYYY-MM-DD[/red]")
+                    sys.exit(1)
+        
+        with MSSQLConnection(config.mssql) as conn:
+            ct = MSSQLChangeTracking(conn)
+            
+            # Check CT status first
+            status = ct.get_table_ct_status(table, schema)
+            if not status.is_enabled_on_database:
+                console.print("[red]Error: Change Tracking is not enabled on the database[/red]")
+                sys.exit(1)
+            if not status.is_enabled_on_table:
+                console.print(f"[red]Error: Change Tracking is not enabled on table {schema}.{table}[/red]")
+                sys.exit(1)
+            
+            # Get current and min versions
+            current_version = ct.get_current_version()
+            min_version = ct.get_min_valid_version(table, schema)
+            
+            console.print(f"[dim]Current CT Version: {current_version}, Min Valid Version: {min_version}[/dim]")
+            
+            # Get changes
+            changes = ct.get_changes(
+                table_name=table,
+                schema=schema,
+                since_version=since_version,
+                since_timestamp=since_timestamp
+            )
+            
+            # Limit results
+            if len(changes) > limit:
+                changes = changes[:limit]
+                console.print(f"[yellow]Warning: Limited to {limit} changes (total available: {len(changes)})[/yellow]")
+            
+            if not changes:
+                if output_format == "summary":
+                    # Return empty summary
+                    summary = {
+                        "table": f"{schema}.{table}",
+                        "since": since,
+                        "since_version": since_version,
+                        "current_version": current_version,
+                        "total": 0,
+                        "inserts": 0,
+                        "updates": 0,
+                        "deletes": 0,
+                        "changes": []
+                    }
+                    print_json_clean(summary)
+                else:
+                    console.print("[yellow]No changes found[/yellow]")
+                return
+            
+            # Format and display
+            if output_format == "summary":
+                # Summary only - for comparison with journal
+                op_counts = {"I": 0, "U": 0, "D": 0}
+                for change in changes:
+                    op = change.sys_change_operation
+                    if op in op_counts:
+                        op_counts[op] += 1
+                
+                summary = {
+                    "table": f"{schema}.{table}",
+                    "since": since,
+                    "since_version": since_version,
+                    "current_version": current_version,
+                    "total": len(changes),
+                    "inserts": op_counts["I"],
+                    "updates": op_counts["U"],
+                    "deletes": op_counts["D"],
+                    "changes": [
+                        {
+                            "version": c.sys_change_version,
+                            "operation": c.sys_change_operation,
+                            "pk": c.primary_key_values
+                        }
+                        for c in changes
+                    ]
+                }
+                print_json_clean(summary)
+            elif output_format == "json":
+                results = []
+                for change in changes:
+                    result = {
+                        "SYS_CHANGE_VERSION": change.sys_change_version,
+                        "SYS_CHANGE_OPERATION": change.sys_change_operation,
+                        "SYS_CHANGE_COLUMNS": change.sys_change_columns,
+                        "SYS_CHANGE_CONTEXT": change.sys_change_context,
+                        "PRIMARY_KEY_VALUES": change.primary_key_values
+                    }
+                    results.append(result)
+                print_json_clean(results)
+            else:
+                # Table output
+                from .utils.formatters import print_table
+                
+                formatted = ct.format_changes_table(changes)
+                if formatted:
+                    columns = list(formatted[0].keys())
+                    rows = [[str(row.get(col, "")) for col in columns] for row in formatted]
+                    
+                    console.print(print_table(
+                        console,
+                        columns,
+                        rows,
+                        title=f"Change Tracking Changes for {schema}.{table} ({len(changes)} rows)"
+                    ))
+                
+                # Summary
+                op_counts = {}
+                for change in changes:
+                    op = change.sys_change_operation
+                    op_counts[op] = op_counts.get(op, 0) + 1
+                
+                summary = ", ".join(f"{op}={count}" for op, count in op_counts.items())
+                console.print(f"[green]Operations: {summary}[/green]")
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@ct.command("enable-db")
+@click.option("--retention", "-r", type=int, default=2, show_default=True, help="Retention period in days")
+@click.option("--auto-cleanup/--no-auto-cleanup", default=True, show_default=True, help="Enable auto cleanup")
+@click.option("--admin-user", "-U", help="SQL Server admin user with ALTER DATABASE permission")
+@click.option("--admin-password", "-P", help="Password for admin user")
+@click.pass_context
+def mssql_ct_enable_db(
+    ctx: click.Context,
+    retention: int,
+    auto_cleanup: bool,
+    admin_user: Optional[str],
+    admin_password: Optional[str]
+) -> None:
+    """Enable Change Tracking on the database.
+    
+    Requires ALTER DATABASE permission (sysadmin or db_owner).
+    
+    Examples:
+        qadmcli mssql ct enable-db
+        qadmcli mssql ct enable-db -r 7 --no-auto-cleanup
+        qadmcli mssql ct enable-db -U sa -P <password>
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_ct import MSSQLChangeTracking
+        
+        # Use admin credentials if provided
+        mssql_config = config.mssql
+        if admin_user:
+            from .models.connection import MSSQLConnection as MSSQLConnectionModel
+            mssql_config = MSSQLConnectionModel(
+                host=config.mssql.host,
+                port=config.mssql.port,
+                username=admin_user,
+                password=admin_password or "",
+                database=config.mssql.database
+            )
+        
+        with MSSQLConnection(mssql_config) as conn:
+            ct = MSSQLChangeTracking(conn)
+            
+            # Check current status
+            status = ct.get_database_ct_status()
+            if status["is_enabled"]:
+                console.print(f"[yellow]Change Tracking is already enabled on database '{status['database_name']}'[/yellow]")
+                console.print(f"  Retention Period: {status['retention_period']} {status['retention_period_units']}")
+                console.print(f"  Auto Cleanup: {'Yes' if status['auto_cleanup'] else 'No'}")
+                return
+            
+            # Enable CT
+            console.print(f"[cyan]Enabling Change Tracking on database '{status['database_name']}'...[/cyan]")
+            console.print(f"  Retention: {retention} days")
+            console.print(f"  Auto Cleanup: {'Yes' if auto_cleanup else 'No'}")
+            
+            try:
+                ct.enable_database_ct(retention_days=retention, auto_cleanup=auto_cleanup)
+                console.print(f"[green]Change Tracking enabled successfully![/green]")
+            except Exception as e:
+                error_msg = str(e)
+                if "permission" in error_msg.lower() or "denied" in error_msg.lower():
+                    console.print("[red]Error: Insufficient permissions to enable Change Tracking[/red]")
+                    console.print("[dim]This operation requires ALTER DATABASE permission (sysadmin or db_owner role)[/dim]")
+                    if not admin_user:
+                        console.print("[dim]Tip: Use -U and -P to provide admin credentials[/dim]")
+                raise
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@ct.command("disable-db")
+@click.confirmation_option(prompt="Are you sure you want to disable Change Tracking on the database?")
+@click.option("--admin-user", "-U", help="SQL Server admin user with ALTER DATABASE permission")
+@click.option("--admin-password", "-P", help="Password for admin user")
+@click.pass_context
+def mssql_ct_disable_db(
+    ctx: click.Context,
+    admin_user: Optional[str],
+    admin_password: Optional[str]
+) -> None:
+    """Disable Change Tracking on the database.
+    
+    WARNING: This will remove all CT history. Requires ALTER DATABASE permission.
+    
+    Examples:
+        qadmcli mssql ct disable-db
+        qadmcli mssql ct disable-db -U sa -P <password>
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_ct import MSSQLChangeTracking
+        
+        # Use admin credentials if provided
+        mssql_config = config.mssql
+        if admin_user:
+            from .models.connection import MSSQLConnection as MSSQLConnectionModel
+            mssql_config = MSSQLConnectionModel(
+                host=config.mssql.host,
+                port=config.mssql.port,
+                username=admin_user,
+                password=admin_password or "",
+                database=config.mssql.database
+            )
+        
+        with MSSQLConnection(mssql_config) as conn:
+            ct = MSSQLChangeTracking(conn)
+            
+            # Check current status
+            status = ct.get_database_ct_status()
+            if not status["is_enabled"]:
+                console.print(f"[yellow]Change Tracking is already disabled on database '{status['database_name']}'[/yellow]")
+                return
+            
+            # Disable CT
+            console.print(f"[cyan]Disabling Change Tracking on database '{status['database_name']}'...[/cyan]")
+            
+            try:
+                ct.disable_database_ct()
+                console.print(f"[green]Change Tracking disabled successfully![/green]")
+            except Exception as e:
+                error_msg = str(e)
+                if "permission" in error_msg.lower() or "denied" in error_msg.lower():
+                    console.print("[red]Error: Insufficient permissions to disable Change Tracking[/red]")
+                    console.print("[dim]This operation requires ALTER DATABASE permission (sysadmin or db_owner role)[/dim]")
+                    if not admin_user:
+                        console.print("[dim]Tip: Use -U and -P to provide admin credentials[/dim]")
+                raise
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@ct.command("enable-table")
+@click.option("--table", "-t", required=True, help="Table name (e.g., CUSTOMERS)")
+@click.option("--schema", "-s", default="dbo", show_default=True, help="Schema name")
+@click.option("--track-columns/--no-track-columns", default=True, show_default=True, help="Track column changes")
+@click.option("--admin-user", "-U", help="SQL Server admin user with ALTER permission on the table")
+@click.option("--admin-password", "-P", help="Password for admin user")
+@click.pass_context
+def mssql_ct_enable_table(
+    ctx: click.Context,
+    table: str,
+    schema: str,
+    track_columns: bool,
+    admin_user: Optional[str],
+    admin_password: Optional[str]
+) -> None:
+    """Enable Change Tracking on a table.
+    
+    Requires ALTER permission on the table and table must have a primary key.
+    
+    Examples:
+        qadmcli mssql ct enable-table -t CUSTOMERS
+        qadmcli mssql ct enable-table -t CUSTOMERS -s dbo --no-track-columns
+        qadmcli mssql ct enable-table -t CUSTOMERS -U admin -P <password>
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_ct import MSSQLChangeTracking
+        
+        # Use admin credentials if provided
+        mssql_config = config.mssql
+        if admin_user:
+            from .models.connection import MSSQLConnection as MSSQLConnectionModel
+            mssql_config = MSSQLConnectionModel(
+                host=config.mssql.host,
+                port=config.mssql.port,
+                username=admin_user,
+                password=admin_password or "",
+                database=config.mssql.database
+            )
+        
+        with MSSQLConnection(mssql_config) as conn:
+            ct = MSSQLChangeTracking(conn)
+            
+            # Check database CT status first
+            db_status = ct.get_database_ct_status()
+            if not db_status["is_enabled"]:
+                console.print(f"[red]Error: Change Tracking is not enabled on the database[/red]")
+                console.print(f"[dim]Run 'qadmcli mssql ct enable-db' first[/dim]")
+                sys.exit(1)
+            
+            # Check current table status
+            status = ct.get_table_ct_status(table, schema)
+            if status.is_enabled_on_table:
+                console.print(f"[yellow]Change Tracking is already enabled on table '{schema}.{table}'[/yellow]")
+                return
+            
+            # Enable CT on table
+            console.print(f"[cyan]Enabling Change Tracking on table '{schema}.{table}'...[/cyan]")
+            console.print(f"  Track Columns: {'Yes' if track_columns else 'No'}")
+            
+            try:
+                ct.enable_table_ct(table, schema, track_columns_updated=track_columns)
+                console.print(f"[green]Change Tracking enabled successfully on '{schema}.{table}'![/green]")
+            except Exception as e:
+                error_msg = str(e)
+                if "primary key" in error_msg.lower():
+                    console.print("[red]Error: Table does not have a primary key[/red]")
+                    console.print("[dim]Change Tracking requires the table to have a primary key[/dim]")
+                elif "permission" in error_msg.lower() or "denied" in error_msg.lower():
+                    console.print("[red]Error: Insufficient permissions to enable Change Tracking on table[/red]")
+                    console.print("[dim]This operation requires ALTER permission on the table[/dim]")
+                    if not admin_user:
+                        console.print("[dim]Tip: Use -U and -P to provide admin credentials[/dim]")
+                raise
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@ct.command("disable-table")
+@click.option("--table", "-t", required=True, help="Table name (e.g., CUSTOMERS)")
+@click.option("--schema", "-s", default="dbo", show_default=True, help="Schema name")
+@click.confirmation_option(prompt="Are you sure you want to disable Change Tracking on this table?")
+@click.option("--admin-user", "-U", help="SQL Server admin user with ALTER permission on the table")
+@click.option("--admin-password", "-P", help="Password for admin user")
+@click.pass_context
+def mssql_ct_disable_table(
+    ctx: click.Context,
+    table: str,
+    schema: str,
+    admin_user: Optional[str],
+    admin_password: Optional[str]
+) -> None:
+    """Disable Change Tracking on a table.
+    
+    Requires ALTER permission on the table.
+    
+    Examples:
+        qadmcli mssql ct disable-table -t CUSTOMERS
+        qadmcli mssql ct disable-table -t CUSTOMERS -U admin -P <password>
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        if not config.mssql:
+            console.print("[red]Error: MSSQL configuration not found in connection.yaml[/red]")
+            sys.exit(1)
+        
+        from .db.mssql import MSSQLConnection
+        from .db.mssql_ct import MSSQLChangeTracking
+        
+        # Use admin credentials if provided
+        mssql_config = config.mssql
+        if admin_user:
+            from .models.connection import MSSQLConnection as MSSQLConnectionModel
+            mssql_config = MSSQLConnectionModel(
+                host=config.mssql.host,
+                port=config.mssql.port,
+                username=admin_user,
+                password=admin_password or "",
+                database=config.mssql.database
+            )
+        
+        with MSSQLConnection(mssql_config) as conn:
+            ct = MSSQLChangeTracking(conn)
+            
+            # Check current table status
+            status = ct.get_table_ct_status(table, schema)
+            if not status.is_enabled_on_table:
+                console.print(f"[yellow]Change Tracking is already disabled on table '{schema}.{table}'[/yellow]")
+                return
+            
+            # Disable CT on table
+            console.print(f"[cyan]Disabling Change Tracking on table '{schema}.{table}'...[/cyan]")
+            
+            try:
+                ct.disable_table_ct(table, schema)
+                console.print(f"[green]Change Tracking disabled successfully on '{schema}.{table}'![/green]")
+            except Exception as e:
+                error_msg = str(e)
+                if "permission" in error_msg.lower() or "denied" in error_msg.lower():
+                    console.print("[red]Error: Insufficient permissions to disable Change Tracking on table[/red]")
+                    console.print("[dim]This operation requires ALTER permission on the table[/dim]")
+                    if not admin_user:
+                        console.print("[dim]Tip: Use -U and -P to provide admin credentials[/dim]")
+                raise
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def main() -> None:
+    """Main entry point."""
+    cli()
+
+
+if __name__ == "__main__":
+    main()

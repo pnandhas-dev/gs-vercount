@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  gs-vercount:
+    image: localhost/gs-vercount:latest
+    container_name: gs-vercount
+    # host network mode so the container can reach local GlueSync Core Hub at port 1717
+    # and local databases. Port binding is determined by the app listening port (8083).
+    network_mode: host
+    entrypoint: ["uvicorn", "main:app", "--app-dir", "/app/gs-vercount/backend", "--host", "0.0.0.0", "--port", "8083"]
+    env_file:
+      - .env
+    environment:
+      - QADMCLI_PATH=qadmcli
+    volumes:
+      # Persistent cache dir
+      - ./cache:/app/gs-vercount/cache:Z
+      # SQLite database location (metrics/vercount.db)
+      - ./metrics:/app/gs-vercount/metrics:Z
+      # Logs (scheduler.log, mail.log)
+      - ./logs:/app/gs-vercount/logs:Z
+      # HTML verification reports
+      - ./reports:/app/gs-vercount/reports:Z
+      # Mount files for hot-reloading
+      - ./index.html:/app/gs-vercount/index.html:Z
+      - ./backend:/app/gs-vercount/backend:Z
+      # AS400 driver connection configuration
+      - ./config:/app/gs-vercount/config:Z
+    restart: unless-stopped

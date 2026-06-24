@@ -1,0 +1,3364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verify and Report</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --surface-color: #1e293b;
+            --surface-hover: #334155;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --border-color: #334155;
+            --accent-blue: #3b82f6;
+            --accent-blue-hover: #2563eb;
+            --status-running: #10b981;
+            --status-running-bg: rgba(16, 185, 129, 0.1);
+            --status-stopped: #64748b;
+            --status-stopped-bg: rgba(100, 116, 139, 0.1);
+            --status-error: #ef4444;
+            --status-error-bg: rgba(239, 68, 68, 0.1);
+            --radius: 8px;
+            --radius-lg: 12px;
+            --transition: all 0.2s ease;
+            --bg-card: #1e293b;
+        }
+
+        /* Config Badges */
+        .config-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.15rem 0.45rem;
+            border-radius: 4px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            margin-right: 0.25rem;
+            border: 1px solid transparent;
+        }
+        .badge-udf {
+            background-color: rgba(139, 92, 246, 0.15);
+            color: #a78bfa;
+            border-color: rgba(139, 92, 246, 0.3);
+        }
+        .badge-filter {
+            background-color: rgba(236, 72, 153, 0.15);
+            color: #f472b6;
+            border-color: rgba(236, 72, 153, 0.3);
+        }
+        .badge-unlocked {
+            background-color: rgba(234, 179, 8, 0.15);
+            color: #facc15;
+            border-color: rgba(234, 179, 8, 0.3);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            line-height: 1.5;
+            padding: 2rem;
+            min-height: 100vh;
+        }
+
+        .dashboard-container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Header section */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            margin-bottom: 2rem;
+        }
+
+        .title-group h1 {
+            font-size: 1.875rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(to right, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .title-group p {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .config-select {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        .config-select select {
+            background-color: var(--surface-color);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            padding: 0.375rem 0.75rem;
+            border-radius: var(--radius);
+            font-family: inherit;
+            outline: none;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .config-select select:hover {
+            border-color: var(--text-secondary);
+        }
+
+        /* Metrics summary row */
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .card {
+            background-color: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 1.25rem;
+            transition: var(--transition);
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            border-color: var(--text-secondary);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+        }
+
+        .card-label {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+        }
+
+        .card-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .card-subtext {
+            font-size: 0.75rem;
+            color: var(--status-running);
+            margin-top: 0.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        /* Table container */
+        .table-container {
+            background-color: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th {
+            background-color: rgba(15, 23, 42, 0.4);
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border-color);
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.875rem;
+            color: var(--text-primary);
+            white-space: nowrap;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr {
+            transition: var(--transition);
+        }
+
+        tr:hover {
+            background-color: var(--surface-hover);
+        }
+
+        /* Status Badges */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.25rem 0.625rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .status-badge::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .status-running { background-color: var(--status-running-bg); color: var(--status-running); }
+        .status-running::before { background-color: var(--status-running); box-shadow: 0 0 4px var(--status-running); }
+        
+        .status-stopped { background-color: var(--status-stopped-bg); color: var(--text-secondary); }
+        .status-stopped::before { background-color: var(--text-secondary); }
+
+        .status-error { background-color: var(--status-error-bg); color: var(--status-error); }
+        .status-error::before { background-color: var(--status-error); box-shadow: 0 0 4px var(--status-error); }
+
+        /* Typography helpers */
+        .entity-name { font-weight: 600; color: #fff; }
+        .mono-text { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8rem; color: #cbd5e1; }
+        .sub-text { font-size: 0.75rem; color: var(--text-secondary); display: block; margin-top: 0.125rem;}
+        .highlight-lag { color: #facc15; }
+        .critical-lag { color: var(--status-error); }
+
+        /* Action Buttons */
+        .action-cell {
+            text-align: right;
+            width: 100px;
+        }
+        
+        .btn-icon {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 0.5rem;
+            border-radius: var(--radius);
+            transition: var(--transition);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .btn-icon:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+            color: #fff;
+        }
+
+        .btn-play:hover { color: var(--status-running); background-color: var(--status-running-bg); }
+        .btn-pause:hover { color: var(--text-primary); background-color: rgba(255,255,255,0.1); }
+
+        /* Pagination Footer */
+        .pagination-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            background-color: var(--surface-color);
+            border-top: 1px solid var(--border-color);
+        }
+
+        .page-info {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .pagination {
+            display: flex;
+            gap: 0.25rem;
+        }
+
+        .page-btn {
+            background-color: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: var(--radius);
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .page-btn:hover:not(:disabled) {
+            background-color: var(--surface-hover);
+        }
+
+        .page-btn.active {
+            background-color: var(--accent-blue);
+            border-color: var(--accent-blue);
+            font-weight: 600;
+        }
+
+        .page-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            color: var(--text-secondary);
+        }
+
+        .page-btn-wide {
+            width: auto;
+            padding: 0 0.75rem;
+        }
+
+        /* SVG Icons */
+        svg { width: 16px; height: 16px; fill: currentColor; }
+
+        /* Light Theme Variables */
+        [data-theme="light"] {
+            --bg-color: #f8fafc;
+            --surface-color: #ffffff;
+            --surface-hover: #f1f5f9;
+            --text-primary: #0f172a;
+            --text-secondary: #64748b;
+            --border-color: #e2e8f0;
+            --accent-blue: #2563eb;
+            --accent-blue-hover: #1d4ed8;
+            --bg-card: #ffffff;
+        }
+        
+        [data-theme="light"] .entity-name { color: var(--text-primary); }
+        [data-theme="light"] .mono-text { color: #475569; }
+        [data-theme="light"] th { background-color: #f1f5f9; }
+        [data-theme="light"] .title-group h1 { 
+            background: linear-gradient(to right, #2563eb, #7c3aed); 
+            -webkit-background-clip: text; 
+            background-clip: text;
+            -webkit-text-fill-color: transparent; 
+        }
+        [data-theme="light"] .btn-icon:hover {
+            background-color: rgba(0, 0, 0, 0.05);
+            color: var(--text-primary);
+        }
+
+        /* Filter Bar Styles */
+        .filter-bar {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+            background-color: var(--surface-color);
+            padding: 1rem 1.25rem;
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border-color);
+            margin-bottom: 1.5rem;
+            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+        }
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .filter-group label {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+        .filter-group select, .filter-group input {
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.375rem 0.75rem;
+            border-radius: var(--radius);
+            outline: none;
+            font-family: inherit;
+            font-size: 0.875rem;
+            transition: var(--transition);
+        }
+        .filter-group select:focus, .filter-group input:focus {
+            border-color: var(--accent-blue);
+        }
+        .btn-apply {
+            background-color: var(--accent-blue);
+            color: #ffffff;
+            border: none;
+            padding: 0.375rem 1rem;
+            border-radius: var(--radius);
+            font-weight: 500;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: var(--transition);
+            margin-left: auto;
+        }
+        .btn-apply:hover {
+            background-color: var(--accent-blue-hover);
+        }
+
+        /* Custom Multiselect Dropdown */
+        .custom-select {
+            position: relative;
+            width: 200px;
+        }
+        .select-btn {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.375rem 0.75rem;
+            border-radius: var(--radius);
+            font-size: 0.875rem;
+            cursor: pointer;
+            width: 100%;
+            transition: var(--transition);
+        }
+        .select-btn:hover { border-color: var(--text-secondary); }
+        .select-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background-color: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            margin-top: 0.25rem;
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 10;
+            display: none;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        .select-dropdown.show { display: block; }
+        .dropdown-search {
+            padding: 0.5rem;
+            position: sticky;
+            top: 0;
+            background-color: var(--surface-color);
+            z-index: 2;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .dropdown-search input {
+            width: 100%;
+            padding: 0.25rem 0.5rem;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            outline: none;
+            transition: var(--transition);
+        }
+        .dropdown-search input:focus { border-color: var(--accent-blue); }
+        .dropdown-item {
+            padding: 0.5rem 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            transition: var(--transition);
+            font-size: 0.875rem;
+            color: var(--text-primary);
+        }
+        .dropdown-item:hover { background-color: var(--surface-hover); }
+        .dropdown-item input[type="checkbox"] {
+            cursor: pointer;
+            accent-color: var(--accent-blue);
+            margin: 0;
+        }
+
+        /* Theme Toggle */
+        .theme-toggle {
+            background: none;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            padding: 0.375rem;
+            border-radius: var(--radius);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: var(--transition);
+        }
+        .theme-toggle:hover {
+            background-color: var(--surface-hover);
+            color: var(--text-primary);
+        }
+
+        /* ── Tab Navigation ── */
+        .tab-nav {
+            display: flex;
+            gap: 0;
+            border-bottom: 2px solid var(--border-color);
+            margin-top: 1.25rem;
+            margin-bottom: 0;
+        }
+        .tab-btn {
+            padding: 0.6rem 1.5rem;
+            background: none;
+            border: none;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            color: var(--text-secondary);
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            letter-spacing: 0.01em;
+        }
+        .tab-btn:hover { color: var(--text-primary); background: rgba(255,255,255,0.03); }
+        .tab-btn.active { color: var(--accent-blue); border-bottom-color: var(--accent-blue); font-weight: 600; }
+        .tab-panel { display: block; padding-top: 1.5rem; }
+        .tab-panel.hidden { display: none; }
+
+        /* ── Verify Tool ── */
+        .verify-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1.25rem;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        .verify-toolbar h2 {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .verify-toolbar .toolbar-right { display: flex; gap: 0.75rem; align-items: center; }
+        .btn-run {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1.25rem;
+            background: linear-gradient(135deg, #3b82f6, #6366f1);
+            color: white;
+            border: none;
+            border-radius: var(--radius);
+            font-family: inherit;
+            font-size: 0.875rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            box-shadow: 0 2px 8px rgba(99,102,241,0.35);
+        }
+        .btn-run:hover { opacity: 0.88; transform: translateY(-1px); }
+        .btn-run:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+        .btn-run svg { width: 16px; height: 16px; fill: white; }
+        .verify-status-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+        .verify-table-wrap {
+            overflow-x: auto;
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border-color);
+        }
+        .verify-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.82rem;
+            min-width: 1100px;
+        }
+        .verify-table thead th {
+            background: var(--surface-color);
+            padding: 0.65rem 0.9rem;
+            text-align: left;
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            white-space: nowrap;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .verify-table thead th.group-header {
+            text-align: center;
+            color: var(--accent-blue);
+            border-bottom: 2px solid var(--accent-blue);
+        }
+        .verify-table tbody td {
+            padding: 0.65rem 0.9rem;
+            border-bottom: 1px solid rgba(51,65,85,0.5);
+            vertical-align: middle;
+            color: var(--text-primary);
+        }
+        .verify-table tbody tr:last-child td { border-bottom: none; }
+        .verify-table tbody tr:hover { background: rgba(255,255,255,0.025); }
+        .val-loading { color: var(--text-secondary); font-style: italic; }
+        .val-ok { color: var(--status-running); font-weight: 600; }
+        .val-warn { color: #f59e0b; font-weight: 600; }
+        .val-err { color: var(--status-error); font-weight: 600; }
+        .mode-badge {
+            display: inline-block;
+            padding: 0.2rem 0.55rem;
+            border-radius: 99px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+        }
+        .mode-cdc  { background: rgba(59,130,246,0.15); color: #60a5fa; }
+        .mode-snap { background: rgba(245,158,11,0.15); color: #fbbf24; }
+        .mode-none { background: rgba(100,116,139,0.15); color: #94a3b8; }
+        .diff-ok   { color: var(--status-running); }
+        .diff-warn { color: #f59e0b; }
+        .diff-err  { color: var(--status-error); }
+
+        /* Settings Modal CSS */
+        .modal-overlay.hidden {
+            display: none !important;
+        }
+        .side-tab-btn {
+            padding: 0.6rem 0.85rem;
+            border-radius: 8px;
+            border: none;
+            background: none;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            font-weight: 500;
+            text-align: left;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .side-tab-btn:hover {
+            background: rgba(255,255,255,0.05);
+            color: var(--text-primary);
+        }
+        .side-tab-btn.active {
+            background: var(--accent-blue);
+            color: #fff;
+        }
+        
+        /* Settings Modal Light Theme Adjustments */
+        [data-theme="light"] .modal-card {
+            background: #ffffff !important;
+            border-color: #e2e8f0 !important;
+        }
+        [data-theme="light"] .modal-header {
+            border-bottom-color: #e2e8f0 !important;
+        }
+        [data-theme="light"] .side-tab-btn {
+            color: #475569 !important;
+        }
+        [data-theme="light"] .side-tab-btn:hover {
+            background: rgba(0, 0, 0, 0.05) !important;
+            color: var(--text-primary) !important;
+        }
+        [data-theme="light"] .side-tab-btn.active {
+            background: var(--accent-blue) !important;
+            color: #ffffff !important;
+        }
+        [data-theme="light"] .modal-body input,
+        [data-theme="light"] .modal-body select,
+        [data-theme="light"] .modal-body textarea {
+            background: #f8fafc !important;
+            border-color: #cbd5e1 !important;
+            color: #0f172a !important;
+        }
+        [data-theme="light"] .modal-body select option {
+            background: #ffffff !important;
+            color: #0f172a !important;
+        }
+        [data-theme="light"] .settings-tab-panel {
+            background: #ffffff !important;
+            color: #0f172a !important;
+        }
+        [data-theme="light"] .modal-body div {
+            border-color: #e2e8f0 !important;
+        }
+        .settings-tab-panel.hidden {
+            display: none !important;
+        }
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 36px;
+            height: 20px;
+        }
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: var(--border-color);
+            transition: .2s;
+            border-radius: 20px;
+        }
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 14px;
+            width: 14px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .2s;
+            border-radius: 50%;
+        }
+        input:checked + .slider {
+            background-color: var(--status-running);
+        }
+        input:checked + .slider:before {
+            transform: translateX(16px);
+        }
+    </style>
+</head>
+<body>
+
+<div class="dashboard-container">
+    
+    <!-- Top Header -->
+    <div class="header">
+        <div class="title-group">
+            <h1>Verify and Report</h1>
+            <nav class="tab-nav" role="tablist">
+                <button class="tab-btn active" id="tab-btn-verify" onclick="switchTab('verify')" role="tab">🔍 Verify Tool</button>
+                <button class="tab-btn" id="tab-btn-reports" onclick="switchTab('reports')" role="tab">📜 Report History</button>
+            </nav>
+        </div>
+        <div class="controls">
+            <button class="theme-toggle" id="themeToggle" title="Toggle Theme">
+                <svg id="themeIcon" viewBox="0 0 24 24"><path d="M12 3c-4.97 0-9 4.03-9 9s4.03 9 9 9 9-4.03 9-9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z"/></svg>
+            </button>
+            <button class="theme-toggle" id="settingsToggle" title="Scheduler Settings" onclick="openSettingsModal()">
+                <svg viewBox="0 0 24 24" style="width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+            </button>
+            <div class="config-select">
+                <label for="pipelineSelect">Pipeline:</label>
+                <select id="pipelineSelect" onchange="handlePipelineChange(this.value)">
+                    <option value="">Loading...</option>
+                </select>
+            </div>
+            <div class="config-select">
+                <label for="rowsPerPage">Rows per page:</label>
+                <select id="rowsPerPage">
+                    <option value="10">10</option>
+                    <option value="25" selected>25</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ TAB 1: Entities List ══ -->
+    <div id="tab-entities" class="tab-panel hidden" role="tabpanel">
+
+    <!-- Filter Bar -->
+    <div class="filter-bar">
+        <div class="filter-group">
+            <label>Group</label>
+            <div class="custom-select" id="groupSelect">
+                <button class="select-btn" id="groupSelectBtn">
+                    <span id="groupSelectText">All Groups</span>
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7 10l5 5 5-5z"/></svg>
+                </button>
+                <div class="select-dropdown" id="groupDropdown">
+                    <div class="dropdown-search">
+                        <input type="text" id="groupSearchInput" placeholder="Search groups..." />
+                    </div>
+                    <label class="dropdown-item">
+                        <input type="checkbox" value="hr" class="group-checkbox"> HR
+                    </label>
+                    <label class="dropdown-item">
+                        <input type="checkbox" value="finance" class="group-checkbox"> Finance
+                    </label>
+                    <label class="dropdown-item">
+                        <input type="checkbox" value="inventory" class="group-checkbox"> Inventory
+                    </label>
+                    <label class="dropdown-item">
+                        <input type="checkbox" value="sales" class="group-checkbox"> Sales
+                    </label>
+                </div>
+            </div>
+        </div>
+        <div class="filter-group">
+            <label for="filterEntity">Entity Name</label>
+            <input type="text" id="filterEntity" placeholder="e.g. customer*" />
+        </div>
+        <button class="btn-apply">Apply</button>
+    </div>
+
+    <!-- Quick Stats -->
+    <div class="summary-cards">
+        <div class="card">
+            <div class="card-label">Total Entities</div>
+            <div class="card-value">124</div>
+            <div class="card-subtext">Active configuration</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Running</div>
+            <div class="card-value" style="color: var(--status-running)">118</div>
+            <div class="card-subtext">95% uptime</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Total Processed (24h)</div>
+            <div class="card-value">14.2M</div>
+            <div class="card-subtext">↑ 12% vs yesterday</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Avg Global Lag</div>
+            <div class="card-value">2.4s</div>
+            <div class="card-subtext">Healthy</div>
+        </div>
+    </div>
+
+    <!-- Main Data Table -->
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>DB Health</th>
+                    <th>Entity Name</th>
+                    <th>Source Table</th>
+                    <th>Target Table</th>
+                    <th>Configuration</th>
+                    <th>Last Replication</th>
+                    <th>Journal Seq / CDC ID</th>
+                    <th>Throughput</th>
+                    <th>Lag</th>
+                    <th class="action-cell">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td colspan="11" style="text-align: center; color: var(--text-secondary);">Loading entities...</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <!-- Pagination -->
+        <div class="pagination-container">
+            <div class="page-info">
+                Showing <strong id="statsTotalShowing">0</strong> of <strong id="statsTotalConfigured">0</strong> entities
+            </div>
+            <div class="pagination" style="display: none;">
+                <button class="page-btn page-btn-wide" disabled>Previous</button>
+                <button class="page-btn active">1</button>
+                <button class="page-btn page-btn-wide">Next</button>
+            </div>
+        </div>
+    </div>
+
+    </div><!-- /tab-entities -->
+
+    <!-- ══ TAB 2: Verify Tool ══ -->
+    <div id="tab-verify" class="tab-panel" role="tabpanel">
+
+        <div class="verify-toolbar">
+            <h2>Source ↔ Target Reconciliation</h2>
+            <div class="toolbar-right">
+                <span class="verify-status-label" id="verifyStatusLabel">Ready — click Run to execute counts</span>
+                <button class="btn-run" id="btnRunVerify" onclick="runVerification()">
+                    <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                    Run Verification
+                </button>
+                <button class="btn-run" id="btnSaveVerify" onclick="saveVerifyReport()" style="display: none; background: linear-gradient(135deg, #10b981 0%, #059669 100%); margin-left: 10px;">
+                    <svg viewBox="0 0 24 24" width="16" height="16" style="fill: white; margin-right: 6px; vertical-align: middle;"><path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>
+                    Save to History
+                </button>
+            </div>
+        </div>
+
+        <div class="verify-table-wrap">
+            <table class="verify-table" id="verifyTable">
+                <thead>
+                    <tr>
+                        <th rowspan="2" style="width: 40px; text-align: center;"><input type="checkbox" id="selectAllVerify" checked onclick="toggleAllVerifyCheckboxes(this.checked)"></th>
+                        <th rowspan="2">Status</th>
+                        <th rowspan="2">Entity Name</th>
+                        <th colspan="2" class="group-header">Source (AS400)</th>
+                        <th colspan="2" class="group-header">Target (MSSQL)</th>
+                        <th rowspan="2">Difference</th>
+                        <th rowspan="2">Verification</th>
+                    </tr>
+                    <tr>
+                        <th>Table</th>
+                        <th>No. of Records / Last Count Time</th>
+                        <th>Table</th>
+                        <th>No. of Records / Last Count Time</th>
+                    </tr>
+                </thead>
+                <tbody id="verifyTbody">
+                    <tr><td colspan="9" style="text-align:center;color:var(--text-secondary);padding:2rem">Select a pipeline and click <strong>Run Verification</strong> to start</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+    </div><!-- /tab-verify -->
+
+    <!-- ══ TAB 3: Report History ══ -->
+    <div id="tab-reports" class="tab-panel hidden" role="tabpanel">
+        <div class="verify-toolbar">
+            <h2>Saved Verification Reports</h2>
+            <div class="toolbar-right">
+                <span class="verify-status-label" id="reportsStatusLabel">Select pipeline to view history</span>
+            </div>
+        </div>
+
+        <!-- Filter Bar -->
+        <div style="display:flex; gap:0.75rem; align-items:center; margin-bottom:1rem; flex-wrap:wrap;">
+            <input type="text" id="reportFilterText" placeholder="🔍 Search entity…"
+                style="flex:1; min-width:180px; padding:0.45rem 0.75rem; border-radius:8px;
+                       background:var(--bg-secondary); border:1px solid var(--border-color);
+                       color:var(--text-primary); font-size:0.85rem; outline:none;"
+                onkeydown="if(event.key === 'Enter') filterReportHistory()">
+            <button onclick="filterReportHistory()"
+                style="padding:0.45rem 0.9rem; border-radius:8px; border:none; cursor:pointer;
+                       background:var(--accent-blue); color:#fff; font-size:0.85rem; font-weight:600;
+                       transition: opacity 0.15s;" onmouseover="this.style.opacity=.8" onmouseout="this.style.opacity=1">
+                Apply
+            </button>
+            <input type="datetime-local" id="reportFilterFrom" onchange="filterReportHistory()"
+                style="padding:0.45rem 0.75rem; border-radius:8px; background:var(--bg-secondary);
+                       border:1px solid var(--border-color); color:var(--text-primary); font-size:0.85rem;"
+                title="From date/time">
+            <input type="datetime-local" id="reportFilterTo" onchange="filterReportHistory()"
+                style="padding:0.45rem 0.75rem; border-radius:8px; background:var(--bg-secondary);
+                       border:1px solid var(--border-color); color:var(--text-primary); font-size:0.85rem;"
+                title="To date/time">
+            <select id="reportFilterStatus" onchange="filterReportHistory()"
+                style="padding:0.45rem 0.75rem; border-radius:8px; background:var(--bg-secondary);
+                       border:1px solid var(--border-color); color:var(--text-primary); font-size:0.85rem;">
+                <option value="">All Statuses</option>
+                <option value="pass">✓ Pass (All In Sync)</option>
+                <option value="fail">✗ Has Discrepancy</option>
+            </select>
+            <button onclick="loadReports(selectedPipelineId)"
+                style="padding:0.45rem 0.9rem; border-radius:8px; border:none; cursor:pointer;
+                       background:var(--bg-secondary); border:1px solid var(--border-color); color:var(--text-primary); font-size:0.85rem; font-weight:600;">
+                ↻ Refresh
+            </button>
+            <button id="btnBulkDeleteReports" onclick="deleteSelectedReports()" disabled
+                style="padding:0.45rem 0.9rem; border-radius:8px; border:none; cursor:pointer;
+                       background:var(--status-error); color:#fff; font-size:0.85rem; font-weight:600;
+                       opacity:0.5; transition: all 0.15s; display: inline-flex; align-items: center; gap: 0.25rem;">
+                🗑 Delete Selected
+            </button>
+        </div>
+
+        <!-- Summary Bar -->
+        <div id="reportsSummaryBar" style="display:none; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;"
+             class="summary-bar">
+            <span id="reportsSummaryTotal" style="color:var(--text-secondary); font-size:0.85rem;"></span>
+            <span id="reportsSummaryPass" style="color:var(--status-running); font-size:0.85rem;"></span>
+            <span id="reportsSummaryFail" style="color:var(--status-error); font-size:0.85rem;"></span>
+        </div>
+
+        <div class="table-container">
+            <table class="verify-table" id="reportsTable">
+                <thead>
+                    <tr>
+                        <th style="width: 40px; text-align: center;"><input type="checkbox" id="reportsSelectAll" onchange="toggleSelectAllReports(this.checked)"></th>
+                        <th>Pipeline</th>
+                        <th>Created At</th>
+                        <th>Entities</th>
+                        <th>Summary</th>
+                        <th>Size</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="reportsTbody">
+                    <tr><td colspan="7" style="text-align:center;color:var(--text-secondary);padding:2rem">No reports saved yet.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Reports Pagination -->
+        <div class="pagination-container" id="reportsPaginationContainer" style="margin-top: 1rem; display: none;">
+            <div class="page-info">
+                Showing <strong id="reportsShowingCount">0-0</strong> of <strong id="reportsTotalCount">0</strong> reports
+            </div>
+            <div class="pagination" id="reportsPagination">
+                <!-- Dynamically generated page buttons -->
+            </div>
+        </div>
+    </div><!-- /tab-reports -->
+
+</div>
+
+    <!-- ══ SETTINGS MODAL ══ -->
+    <div id="settingsModal" class="modal-overlay hidden" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); backdrop-filter:blur(8px); z-index:1000; align-items:center; justify-content:center; padding:1.5rem;">
+        <div class="modal-card" style="width:100%; max-width:1100px; height:85%; background:var(--bg-card); border:1px solid var(--border-color); border-radius:16px; display:flex; flex-direction:column; box-shadow:0 12px 24px -4px rgba(0,0,0,0.2); overflow:hidden;">
+            <!-- Modal Header -->
+            <div class="modal-header" style="padding:1.25rem 1.5rem; border-bottom:1px solid var(--border-color); display:flex; align-items:center; justify-content:space-between;">
+                <h2 style="margin:0; font-size:1.2rem; font-weight:700; color:var(--accent-primary); display:flex; align-items:center; gap:0.5rem;">
+                    ⚙️ Scheduler & Profiling Settings
+                </h2>
+                <button onclick="closeSettingsModal()" style="background:none; border:none; color:var(--text-secondary); cursor:pointer; font-size:1.5rem; font-weight:700; line-height:1;">×</button>
+            </div>
+            
+            <!-- Modal Body (Two column / Split pane layout) -->
+            <div class="modal-body" style="flex:1; display:flex; overflow:hidden;">
+                <!-- Left Sidebar Nav -->
+                <div class="sidebar-nav" style="width:180px; border-right:1px solid var(--border-color); padding:1rem; display:flex; flex-direction:column; gap:0.5rem; background:var(--bg-secondary);">
+                    <button class="side-tab-btn active" id="btn-stab-jobs" onclick="switchSettingsTab('jobs')">📅 Jobs List</button>
+                    <button class="side-tab-btn" id="btn-stab-report-profiles" onclick="switchSettingsTab('report-profiles')">📋 Report Profiles</button>
+                    <button class="side-tab-btn" id="btn-stab-mailer-profiles" onclick="switchSettingsTab('mailer-profiles')">✉️ Mailer Profiles</button>
+                    <button class="side-tab-btn" id="btn-stab-logs" onclick="switchSettingsTab('logs')">📜 Scheduler Logs</button>
+                    <button class="side-tab-btn" id="btn-stab-global-settings" onclick="switchSettingsTab('global-settings')">⚙️ Global Config</button>
+                </div>
+                
+                <!-- Right Tab Contents -->
+                <div class="tab-content-area" style="flex:1; padding:1.5rem; overflow-y:auto; display:flex; flex-direction:column;">
+                    
+                    <!-- TAB: JOBS -->
+                    <div id="settings-tab-jobs" class="settings-tab-panel">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+                            <h3 style="margin:0; font-size:1.1rem;">Scheduled Verification Jobs</h3>
+                            <button class="btn-create" onclick="showCreateJobForm()" style="padding:0.4rem 0.8rem; border-radius:6px; background:var(--accent-blue); color:#fff; font-size:0.8rem; font-weight:600; border:none; cursor:pointer;">+ Add Job</button>
+                        </div>
+                        
+                        <!-- Jobs List Table -->
+                        <table style="width:100%; border-collapse:collapse; font-size:0.85rem;">
+                            <thead>
+                                <tr>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Status</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Name</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Schedule (Cron)</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Profiles</th>
+                                    <th style="text-align:right; padding:0.5rem; border-bottom:1px solid var(--border-color);">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="jobsTbody">
+                                <!-- Populated dynamically -->
+                            </tbody>
+                        </table>
+                        
+                        <!-- Create Job Form Overlay -->
+                        <div id="jobFormContainer" style="display:none; margin-top:1.5rem; padding:1rem; border:1px solid var(--border-color); border-radius:10px; background:var(--bg-secondary);">
+                            <h4 style="margin-top:0; margin-bottom:1rem;">Create Scheduler Job</h4>
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1rem;">
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Job Name</label>
+                                    <input type="text" id="jobNameInput" placeholder="e.g. Daily Sync Check" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;">
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Target Pipeline</label>
+                                    <select id="jobPipelineSelect" onchange="loadProfilesForPipelineSelection(this.value)" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;"></select>
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Report Profile</label>
+                                    <select id="jobReportProfileSelect" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;"></select>
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Mailer Profile</label>
+                                    <select id="jobMailerProfileSelect" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;"></select>
+                                </div>
+                            </div>
+                            
+                            <!-- Cron settings -->
+                            <div style="margin-bottom:1rem; padding:0.75rem; border:1px solid var(--border-color); border-radius:8px; background:var(--bg-card);">
+                                <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem; font-weight:600;">Execution Cron Schedule</label>
+                                <select id="cronPresetSelect" onchange="applyCronPreset(this.value)" style="width:100%; padding:0.4rem; margin-bottom:0.75rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-secondary); color:var(--text-primary); font-size:0.85rem;">
+                                    <option value="">-- Choose a Preset Template --</option>
+                                    <option value="* * * * *">Every minute (* * * * *)</option>
+                                    <option value="*/5 * * * *">Every 5 minutes (*/5 * * * *)</option>
+                                    <option value="*/15 * * * *">Every 15 minutes (*/15 * * * *)</option>
+                                    <option value="*/30 * * * *">Every 30 minutes (*/30 * * * *)</option>
+                                    <option value="0 * * * *">Hourly at minute 0 (0 * * * *)</option>
+                                    <option value="0 0,12 * * *">Twice daily at 00:00 & 12:00 (0 0,12 * * *)</option>
+                                    <option value="0 1 * * *">Daily at 01:00 AM (0 1 * * *)</option>
+                                    <option value="0 9 * * *">Daily at 09:00 AM (0 9 * * *)</option>
+                                    <option value="0 9 * * 1-5">Every weekday at 09:00 AM (0 9 * * 1-5)</option>
+                                    <option value="0 9 * * 0,6">Every weekend at 09:00 AM (0 9 * * 0,6)</option>
+                                    <option value="0 0 * * 0">Weekly on Sundays at 00:00 (0 0 * * 0)</option>
+                                    <option value="0 20 * * 5">Weekly on Fridays at 20:00 (0 20 * * 5)</option>
+                                    <option value="0 0 1 * *">Monthly on the 1st at 00:00 (0 0 1 * *)</option>
+                                </select>
+                                
+                                <div style="display:grid; grid-template-columns:repeat(5, 1fr); gap:0.5rem; margin-bottom:0.5rem;">
+                                    <div>
+                                        <span style="display:block; font-size:0.65rem; color:var(--text-secondary); text-align:center; margin-bottom:0.15rem;">Minute</span>
+                                        <input type="text" id="cronMin" placeholder="*" oninput="updateCronFromSplit()" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem; text-align:center;">
+                                    </div>
+                                    <div>
+                                        <span style="display:block; font-size:0.65rem; color:var(--text-secondary); text-align:center; margin-bottom:0.15rem;">Hour</span>
+                                        <input type="text" id="cronHour" placeholder="*" oninput="updateCronFromSplit()" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem; text-align:center;">
+                                    </div>
+                                    <div>
+                                        <span style="display:block; font-size:0.65rem; color:var(--text-secondary); text-align:center; margin-bottom:0.15rem;">Day (Month)</span>
+                                        <input type="text" id="cronDom" placeholder="*" oninput="updateCronFromSplit()" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem; text-align:center;">
+                                    </div>
+                                    <div>
+                                        <span style="display:block; font-size:0.65rem; color:var(--text-secondary); text-align:center; margin-bottom:0.15rem;">Month</span>
+                                        <input type="text" id="cronMonth" placeholder="*" oninput="updateCronFromSplit()" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem; text-align:center;">
+                                    </div>
+                                    <div>
+                                        <span style="display:block; font-size:0.65rem; color:var(--text-secondary); text-align:center; margin-bottom:0.15rem;">Day (Week)</span>
+                                        <input type="text" id="cronDow" placeholder="*" oninput="updateCronFromSplit()" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem; text-align:center;">
+                                    </div>
+                                </div>
+                                
+                                <input type="text" id="cronExpressionInput" placeholder="Combined expression" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-secondary); color:var(--text-secondary); font-size:0.85rem; font-family:monospace; text-align:center;" readonly>
+                                <div id="cronHumanReadable" style="font-size:0.75rem; color:var(--status-running); margin-top:0.35rem; font-weight:600; text-align:center;">Every minute</div>
+                            </div>
+                            
+                            <div style="display:flex; justify-content:end; gap:0.5rem;">
+                                <button onclick="cancelCreateJob()" style="padding:0.4rem 0.8rem; border-radius:6px; border:1px solid var(--border-color); background:none; color:var(--text-primary); cursor:pointer;">Cancel</button>
+                                <button onclick="saveSchedulerJob()" style="padding:0.4rem 0.8rem; border-radius:6px; border:none; background:var(--accent-blue); color:#fff; font-weight:600; cursor:pointer;">Save Job</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- TAB: REPORT PROFILES -->
+                    <div id="settings-tab-report-profiles" class="settings-tab-panel hidden">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+                            <h3 style="margin:0; font-size:1.1rem;">Report Profiles</h3>
+                            <button class="btn-create" onclick="showCreateReportProfileForm()" style="padding:0.4rem 0.8rem; border-radius:6px; background:var(--accent-blue); color:#fff; font-size:0.8rem; font-weight:600; border:none; cursor:pointer;">+ Create Profile</button>
+                        </div>
+                        
+                        <table style="width:100%; border-collapse:collapse; font-size:0.85rem; margin-bottom:1rem;">
+                            <thead>
+                                <tr>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Name</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Pipeline</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Entities Included</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Mail Rule</th>
+                                    <th style="text-align:right; padding:0.5rem; border-bottom:1px solid var(--border-color);">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reportProfilesTbody"></tbody>
+                        </table>
+                        
+                        <!-- Create Report Profile Form -->
+                        <div id="reportProfileFormContainer" style="display:none; padding:1rem; border:1px solid var(--border-color); border-radius:10px; background:var(--bg-secondary);">
+                            <h4 style="margin-top:0; margin-bottom:1rem;">New Report Profile</h4>
+                            <div style="margin-bottom:1rem;">
+                                <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Profile Name</label>
+                                <input type="text" id="reportProfileNameInput" placeholder="e.g. Audit Entities Profile" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;">
+                            </div>
+                            <div style="margin-bottom:1rem;">
+                                <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Pipeline</label>
+                                <select id="reportProfilePipelineSelect" onchange="loadReportProfileEntities(this.value)" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;"></select>
+                            </div>
+                            
+                            <!-- Entities list with checkboxes -->
+                            <div style="margin-bottom:1rem;">
+                                <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Select Entities to include in Report</label>
+                                
+                                <!-- Search and Quick Actions -->
+                                <input type="text" id="reportProfileEntitySearch" placeholder="Type to filter entities (e.g. CUSTOMER*)..." oninput="filterReportProfileEntities(this.value)" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.8rem; margin-bottom:0.5rem; outline:none; display:none;">
+                                
+                                <div id="reportProfileEntityActions" style="display:none; justify-content:space-between; align-items:center; font-size:0.8rem; margin-bottom:0.5rem; color:var(--text-secondary);">
+                                    <div style="display:flex; gap:0.75rem;">
+                                        <span onclick="selectAllReportProfileEntities(true)" style="color:var(--accent-blue); cursor:pointer; font-weight:600; text-decoration:underline;">Select All</span>
+                                        <span onclick="selectAllReportProfileEntities(false)" style="color:var(--accent-blue); cursor:pointer; font-weight:600; text-decoration:underline;">Clear All</span>
+                                    </div>
+                                    <div style="font-weight:500;">
+                                        Selected: <span id="reportProfileSelectedCount" style="color:var(--text-primary); font-weight:700;">0</span> / <span id="reportProfileTotalCount">0</span>
+                                    </div>
+                                </div>
+
+                                <div id="reportProfileEntitiesList" style="max-height:200px; overflow-y:auto; padding:0.5rem; border:1px solid var(--border-color); border-radius:8px; background:var(--bg-card);">
+                                    <span style="color:var(--text-secondary); font-size:0.8rem; font-style:italic;">Choose a pipeline first...</span>
+                                </div>
+                                
+                                <!-- Selector Pagination Controls -->
+                                <div id="rpSelectorPagination" style="display:none; justify-content:space-between; align-items:center; margin-top:0.5rem; font-size:0.8rem; color:var(--text-secondary);">
+                                    <button type="button" onclick="changeRpSelectorPage(-1)" id="rpSelectPrevBtn" style="padding:0.25rem 0.5rem; border:1px solid var(--border-color); border-radius:4px; background:none; color:var(--text-primary); cursor:pointer; font-size:0.75rem;">Previous</button>
+                                    <span id="rpSelectPageNum">Page 1 of 1</span>
+                                    <button type="button" onclick="changeRpSelectorPage(1)" id="rpSelectNextBtn" style="padding:0.25rem 0.5rem; border:1px solid var(--border-color); border-radius:4px; background:none; color:var(--text-primary); cursor:pointer; font-size:0.75rem;">Next</button>
+                                </div>
+                            </div>
+                            
+                            <div style="margin-bottom:1.5rem; display:flex; align-items:center; gap:0.5rem;">
+                                <input type="checkbox" id="reportProfileSkipMail" style="cursor:pointer;">
+                                <label for="reportProfileSkipMail" style="font-size:0.85rem; color:var(--text-primary); cursor:pointer;">Skip mailing report if all entities are fully in sync</label>
+                            </div>
+                            
+                            <div style="display:flex; justify-content:end; gap:0.5rem;">
+                                <button onclick="cancelCreateReportProfile()" style="padding:0.4rem 0.8rem; border-radius:6px; border:1px solid var(--border-color); background:none; color:var(--text-primary); cursor:pointer;">Cancel</button>
+                                <button onclick="saveReportProfile()" style="padding:0.4rem 0.8rem; border-radius:6px; border:none; background:var(--accent-blue); color:#fff; font-weight:600; cursor:pointer;">Save Profile</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- TAB: MAILER PROFILES -->
+                    <div id="settings-tab-mailer-profiles" class="settings-tab-panel hidden">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+                            <h3 style="margin:0; font-size:1.1rem;">Mailer Profiles</h3>
+                            <button class="btn-create" onclick="showCreateMailerProfileForm()" style="padding:0.4rem 0.8rem; border-radius:6px; background:var(--accent-blue); color:#fff; font-size:0.8rem; font-weight:600; border:none; cursor:pointer;">+ Create Profile</button>
+                        </div>
+                        
+                        <table style="width:100%; border-collapse:collapse; font-size:0.85rem; margin-bottom:1rem;">
+                            <thead>
+                                <tr>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Name</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Recipient Emails</th>
+                                    <th style="text-align:left; padding:0.5rem; border-bottom:1px solid var(--border-color);">Subject Template</th>
+                                    <th style="text-align:right; padding:0.5rem; border-bottom:1px solid var(--border-color);">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mailerProfilesTbody"></tbody>
+                        </table>
+                        
+                        <!-- Create Mailer Profile Form -->
+                        <div id="mailerProfileFormContainer" style="display:none; padding:1rem; border:1px solid var(--border-color); border-radius:10px; background:var(--bg-secondary);">
+                            <h4 style="margin-top:0; margin-bottom:1rem;">New Mailer Profile</h4>
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1rem;">
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Profile Name</label>
+                                    <input type="text" id="mailerProfileName" placeholder="e.g. Ops Team Alert" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;">
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Recipient Emails (comma separated)</label>
+                                    <input type="text" id="mailerProfileEmails" placeholder="ops@company.com, admin@company.com" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;">
+                                </div>
+                            </div>
+                            <div style="margin-bottom:1rem;">
+                                <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Email Subject Template</label>
+                                <input type="text" id="mailerProfileSubject" placeholder="Replication Report for {pipeline_id}" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;">
+                                <small style="display:block; font-size:0.7rem; color:var(--text-secondary); margin-top:0.25rem;">Variables supported: {pipeline_id}, {job_name}</small>
+                            </div>
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1rem;">
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Greeting Section Header</label>
+                                    <textarea id="mailerProfileBodyHeader" rows="3" placeholder="Hello team, here is the automated replication report..." style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-family:sans-serif; font-size:0.85rem;"></textarea>
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.25rem;">Ending Section Footer</label>
+                                    <textarea id="mailerProfileBodyEnding" rows="3" placeholder="Regards, GlueSync Replica Monitor daemon" style="width:100%; padding:0.4rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-family:sans-serif; font-size:0.85rem;"></textarea>
+                                </div>
+                            </div>
+                            
+                            <div style="display:flex; justify-content:end; gap:0.5rem;">
+                                <button onclick="cancelCreateMailerProfile()" style="padding:0.4rem 0.8rem; border-radius:6px; border:1px solid var(--border-color); background:none; color:var(--text-primary); cursor:pointer;">Cancel</button>
+                                <button onclick="saveMailerProfile()" style="padding:0.4rem 0.8rem; border-radius:6px; border:none; background:var(--accent-blue); color:#fff; font-weight:600; cursor:pointer;">Save Profile</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- TAB: SCHEDULER LOGS -->
+                    <div id="settings-tab-logs" class="settings-tab-panel hidden">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+                            <h3 style="margin:0; font-size:1.1rem;">Recent Daemon Logs</h3>
+                            <button onclick="loadSchedulerLogs()" style="padding:0.4rem 0.8rem; border-radius:6px; border:none; background:var(--accent-blue); color:#fff; font-size:0.8rem; font-weight:600; cursor:pointer;">↻ Refresh Logs</button>
+                        </div>
+                        <div id="schedulerLogsContent" style="flex:1; height:300px; overflow-y:auto; font-family:'Fira Code', monospace; font-size:0.75rem; padding:0.75rem; border:1px solid var(--border-color); border-radius:8px; background:#0f172a; color:#f8fafc; white-space:pre-wrap;">
+                            No logs loaded...
+                        </div>
+                    </div>
+                    
+                    <!-- TAB: GLOBAL SETTINGS -->
+                    <div id="settings-tab-global-settings" class="settings-tab-panel hidden">
+                        <h3 style="margin-top:0; margin-bottom:1rem; font-size:1.1rem;">Global Scheduler Config</h3>
+                        <div style="margin-bottom:1.5rem;">
+                            <label style="display:block; font-size:0.8rem; font-weight:600; color:var(--text-primary); margin-bottom:0.25rem;">Global Scheduler Log File Path</label>
+                            <input type="text" id="settingsLogPath" placeholder="/app/replica-mon/cache/scheduler.log" style="width:100%; max-width:500px; padding:0.45rem 0.75rem; border-radius:6px; border:1px solid var(--border-color); background:var(--bg-card); color:var(--text-primary); font-size:0.85rem;">
+                            <small style="display:block; font-size:0.75rem; color:var(--text-secondary); margin-top:0.25rem;">Make sure the application has permission to write to this location.</small>
+                        </div>
+                        <button onclick="saveGlobalSettings()" style="padding:0.45rem 1rem; border-radius:6px; border:none; background:var(--accent-blue); color:#fff; font-weight:600; font-size:0.85rem; cursor:pointer;">
+                            Save Settings
+                        </button>
+                    </div>
+                    
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+    // Constants for Host Resolution (supports both container service and local file testing)
+    const API_HOST = window.location.hostname ? `${window.location.protocol}//${window.location.host}` : 'http://localhost:8081';
+    const WS_HOST = window.location.hostname ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}` : 'ws://localhost:8081';
+
+    // Application State
+    let allEntities = [];
+    let selectedPipelineId = '';
+    let activeSocket = null;
+    const entityThroughputs = {}; // Cache to compute rates over time
+    const pipelineNames = {};
+
+    // Theme Toggle Logic
+    const themeToggle = document.getElementById('themeToggle');
+    const themeIcon = document.getElementById('themeIcon');
+    
+    const savedTheme = localStorage.getItem('theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    updateIcon(savedTheme);
+
+    themeToggle.addEventListener('click', () => {
+        const currentTheme = document.documentElement.getAttribute('data-theme');
+        const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+        
+        document.documentElement.setAttribute('data-theme', newTheme);
+        localStorage.setItem('theme', newTheme);
+        updateIcon(newTheme);
+    });
+
+    function updateIcon(theme) {
+        if (theme === 'dark') {
+            themeIcon.innerHTML = '<path d="M12 3c-4.97 0-9 4.03-9 9s4.03 9 9 9 9-4.03 9-9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z"/>';
+        } else {
+            themeIcon.innerHTML = '<path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.03 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.03 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM7.05 18.36c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06z"/>';
+        }
+    }
+
+    // Custom Multiselect Logic
+    const groupSelectBtn = document.getElementById('groupSelectBtn');
+    const groupDropdown = document.getElementById('groupDropdown');
+    const groupSelectText = document.getElementById('groupSelectText');
+    const groupSearchInput = document.getElementById('groupSearchInput');
+
+    groupSelectBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        groupDropdown.classList.toggle('show');
+        if (groupDropdown.classList.contains('show') && document.getElementById('groupSearchInput')) {
+            document.getElementById('groupSearchInput').focus();
+        }
+    });
+
+    document.addEventListener('click', (e) => {
+        if (!groupSelectBtn.contains(e.target) && !groupDropdown.contains(e.target)) {
+            groupDropdown.classList.remove('show');
+        }
+    });
+
+    function updateSelectText() {
+        const checkedCount = document.querySelectorAll('.group-checkbox:checked').length;
+        if (checkedCount === 0) {
+            groupSelectText.textContent = 'All Groups';
+        } else if (checkedCount === 1) {
+            const selectedLabel = document.querySelector('.group-checkbox:checked').parentElement.textContent.trim();
+            groupSelectText.textContent = selectedLabel;
+        } else {
+            groupSelectText.textContent = `${checkedCount} selected`;
+        }
+    }
+
+    // Pipeline Data Ingestion & Rendering
+    async function loadPipelines() {
+        try {
+            const res = await fetch(`${API_HOST}/api/pipelines`);
+            if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+            const pipelines = await res.json();
+            
+            const select = document.getElementById('pipelineSelect');
+            select.innerHTML = '';
+            
+            if (!pipelines || pipelines.length === 0) {
+                select.innerHTML = '<option value="">No pipelines active</option>';
+                document.querySelector('tbody').innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--text-secondary);">No pipelines found</td></tr>';
+                return;
+            }
+
+            pipelines.forEach(p => {
+                pipelineNames[p.pipelineId] = p.name || p.pipelineId;
+                const opt = document.createElement('option');
+                opt.value = p.pipelineId;
+                opt.textContent = p.name || p.pipelineId;
+                select.appendChild(opt);
+            });
+
+            // Automatically load first pipeline
+            select.value = pipelines[0].pipelineId;
+            handlePipelineChange(pipelines[0].pipelineId);
+        } catch (err) {
+            console.error("Error fetching pipelines:", err);
+            document.getElementById('pipelineSelect').innerHTML = '<option value="">Error connecting to API</option>';
+            document.querySelector('tbody').innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--status-error);">Could not connect to backend server. Verify container is running on port 8000.</td></tr>';
+        }
+    }
+
+    // Unified pipeline change handler - works for both tabs
+    function handlePipelineChange(pipelineId) {
+        console.log('[Pipeline] Changed to:', pipelineId);
+        
+        // Update global selectedPipelineId
+        selectedPipelineId = pipelineId;
+        
+        // Sync both dropdowns (header and verify tab if it exists)
+        const headerSelect = document.getElementById('pipelineSelect');
+        const verifySelect = document.getElementById('verifyPipelineSelect');
+        
+        if (headerSelect) headerSelect.value = pipelineId;
+        if (verifySelect) verifySelect.value = pipelineId;
+        
+        // Load entities for Dashboard tab
+        loadEntities(pipelineId);
+        
+        // If Verify tab is currently visible, reload its data too
+        const verifyTab = document.getElementById('tab-verify');
+        if (verifyTab && !verifyTab.classList.contains('hidden')) {
+            console.log('[Pipeline] Verify tab is visible, reloading...');
+            loadVerifyMetadata(pipelineId).catch(err => {
+                console.error('[Pipeline] Error loading verify metadata:', err);
+            });
+        }
+        
+        // If Report History tab is currently visible, reload its data too
+        const reportsTab = document.getElementById('tab-reports');
+        if (reportsTab && !reportsTab.classList.contains('hidden')) {
+            console.log('[Pipeline] Reports tab is visible, reloading...');
+            loadReports(pipelineId).catch(err => {
+                console.error('[Pipeline] Error loading reports:', err);
+            });
+        }
+    }
+
+    async function loadEntities(pipelineId) {
+        if (!pipelineId) return;
+        selectedPipelineId = pipelineId;
+        
+        // Show loading state
+        document.querySelector('tbody').innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--text-secondary);">Loading entities...</td></tr>';
+        
+        try {
+            const res = await fetch(`${API_HOST}/api/pipelines/${pipelineId}/entities`);
+            if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+            allEntities = await res.json();
+            
+            populateGroupsFilter(allEntities);
+            applyFiltersAndRender();
+            
+            // Connect to real-time WebSockets
+            connectWebSocket(pipelineId, allEntities);
+        } catch (err) {
+            console.error("Error loading entities:", err);
+            document.querySelector('tbody').innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--status-error);">Error loading pipeline entities.</td></tr>';
+        }
+    }
+
+    function populateGroupsFilter(entities) {
+        const uniqueGroups = [...new Set(entities.map(e => e.groupId || '_default'))];
+        
+        // Retain the search input element
+        groupDropdown.innerHTML = `
+            <div class="dropdown-search">
+                <input type="text" id="groupSearchInput" placeholder="Search groups..." />
+            </div>
+        `;
+        
+        uniqueGroups.forEach(g => {
+            const label = document.createElement('label');
+            label.className = 'dropdown-item';
+            label.innerHTML = `
+                <input type="checkbox" value="${g}" class="group-checkbox"> ${g === '_default' ? 'Default Group' : g}
+            `;
+            groupDropdown.appendChild(label);
+        });
+
+        // Re-attach filter listeners
+        document.querySelectorAll('.group-checkbox').forEach(cb => {
+            cb.addEventListener('change', updateSelectText);
+        });
+
+        const searchInput = document.getElementById('groupSearchInput');
+        searchInput.addEventListener('input', (e) => {
+            const term = e.target.value.toLowerCase();
+            document.querySelectorAll('.dropdown-item').forEach(item => {
+                const text = item.textContent.toLowerCase();
+                item.style.display = text.includes(term) ? 'flex' : 'none';
+            });
+        });
+
+        updateSelectText();
+    }
+
+    function applyFiltersAndRender() {
+        const selected = Array.from(document.querySelectorAll('.group-checkbox:checked')).map(cb => cb.value);
+        const rawFilter = document.getElementById('filterEntity').value;
+        const isPrefixSearch = rawFilter.endsWith('*');
+        const nameFilter = rawFilter.toLowerCase().replace(/\*/g, '');
+
+        const filtered = allEntities.filter(e => {
+            const groupMatches = selected.length === 0 || selected.includes(e.groupId || '_default');
+            const entityName = (e.entityName || '').toLowerCase();
+            let nameMatches = !nameFilter;
+            if (nameFilter) {
+                if (isPrefixSearch) {
+                    nameMatches = entityName.startsWith(nameFilter);
+                } else {
+                    nameMatches = entityName.includes(nameFilter);
+                }
+            }
+            return groupMatches && nameMatches;
+        });
+
+        renderTable(filtered);
+        updateDashboardStats(filtered);
+    }
+
+    function renderTable(entities) {
+        const tbody = document.querySelector('tbody');
+        tbody.innerHTML = '';
+
+        if (entities.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; color: var(--text-secondary);">No entities matched your filters.</td></tr>';
+            return;
+        }
+
+        entities.forEach(ent => {
+            const tr = document.createElement('tr');
+            tr.setAttribute('data-entity-name', ent.entityName);
+            tr.setAttribute('data-entity-id', ent.entityId || ent.entityName);
+
+            const status = (ent.status || 'STOPPED').toUpperCase();
+            let statusClass = 'status-stopped';
+            let statusText = 'Pause';
+            if (status === 'RUNNING' || status === 'ACTIVE') {
+                statusClass = 'status-running';
+                statusText = 'Active';
+            } else if (status === 'ERROR') {
+                statusClass = 'status-error';
+                statusText = 'Error';
+            }
+
+            const srcAgent = ent.agentEntities && ent.agentEntities[0] ? ent.agentEntities[0] : null;
+            const tgtAgent = ent.agentEntities && ent.agentEntities[1] ? ent.agentEntities[1] : null;
+
+            const srcTable = srcAgent ? `${srcAgent.table?.schema || 'QSYS'}.${srcAgent.table?.name || 'TABLE'}` : '-';
+            const tgtTable = tgtAgent ? `${tgtAgent.table?.schema || 'dbo'}.${tgtAgent.table?.name || 'TABLE'}` : '-';
+
+            // Extract configuration flags
+            const hasUdf = tgtAgent && tgtAgent.entityType && tgtAgent.entityType.mappingFunctionInfo;
+            const hasFilter = tgtAgent && tgtAgent.entityType && tgtAgent.entityType.filter && tgtAgent.entityType.filter.clauses && tgtAgent.entityType.filter.clauses.length > 0;
+            
+            const targetTableId = tgtAgent && tgtAgent.table && tgtAgent.table.id;
+            const unlockedSchemas = tgtAgent && tgtAgent.entityType && tgtAgent.entityType.tablesWithUnlockedSchema;
+            const isSchemaUnlocked = targetTableId && unlockedSchemas && unlockedSchemas.includes(targetTableId);
+
+            let configHtml = '';
+            if (hasUdf) {
+                configHtml += `<span class="config-badge badge-udf" title="User Defined Function: ${tgtAgent.entityType.mappingFunctionInfo.name}">UDF</span>`;
+            }
+            if (hasFilter) {
+                configHtml += `<span class="config-badge badge-filter" title="Filtering enabled on columns/rows">Filter</span>`;
+            }
+            if (isSchemaUnlocked) {
+                configHtml += `<span class="config-badge badge-unlocked" title="Target schema is unlocked (dynamic mapping active)">Unlck</span>`;
+            }
+            if (!configHtml) {
+                configHtml = '<span style="color: var(--text-secondary); font-style: italic; font-size: 0.75rem;">Standard</span>';
+            }
+
+            // Build DB health badge from targetAgentHealth (injected by REST API)
+            const tgtHealth = ent.targetAgentHealth;
+            let healthHtml = '<span style="color:var(--text-secondary);font-size:0.75rem">—</span>';
+            if (tgtHealth) {
+                const connStatus = tgtHealth.connectionStatus || 'UNKNOWN';
+                const healthStatus = tgtHealth.healthStatus || 'UNKNOWN';
+                const dbHost = tgtHealth.connectedDbHost || '';
+                const dbName = tgtHealth.connectedDbName || '';
+                const connErr = tgtHealth.connectionError || '';
+                const isConn = connStatus === 'CONNECTED';
+                const isHealthy = healthStatus === 'HEALTHY';
+                const connColor = isConn ? 'var(--status-running)' : (connStatus === 'UNKNOWN' ? 'var(--text-secondary)' : 'var(--status-error)');
+                const connIcon = isConn ? '●' : (connStatus === 'UNKNOWN' ? '○' : '✕');
+                const tooltip = connErr
+                    ? `${connStatus} — Error: ${connErr}`
+                    : `${connStatus} / ${healthStatus}${dbHost ? ' — ' + dbHost : ''}${dbName ? '/' + dbName : ''}`;
+                healthHtml = `<span class="db-health-badge" title="${tooltip}"
+                    style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;font-weight:600;
+                           color:${connColor};cursor:default;">
+                    <span style="font-size:0.7rem">${connIcon}</span>
+                    ${isConn ? (isHealthy ? 'OK' : 'Degraded') : (connStatus === 'UNKNOWN' ? 'N/A' : 'Offline')}
+                </span>`;
+            }
+
+            const isRunning = status === 'RUNNING' || status === 'ACTIVE';
+            const actionBtn = isRunning
+                ? `<button class="btn-icon btn-pause" title="Pause Replication" onclick="toggleEntityReplication('${ent.entityName}', true)">
+                       <svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                   </button>`
+                : `<button class="btn-icon btn-play" title="Start Replication" onclick="toggleEntityReplication('${ent.entityName}', false)">
+                       <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                   </button>`;
+
+            tr.innerHTML = `
+                <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                <td class="agent-health-cell">${healthHtml}</td>
+                <td><span class="entity-name">${ent.entityName}</span><span class="sub-text">Group: ${ent.groupId || 'default'}</span></td>
+                <td><span class="mono-text">${srcTable}</span></td>
+                <td><span class="mono-text">${tgtTable}</span></td>
+                <td>${configHtml}</td>
+                <td class="last-replication">Pending metrics<span class="sub-text">-</span></td>
+                <td class="journal-seq"><span class="mono-text">-</span></td>
+                <td class="throughput">0 rec/s<span class="sub-text">0 total</span></td>
+                <td class="lag"><span class="mono-text">-</span></td>
+                <td class="action-cell">${actionBtn}</td>
+            `;
+
+            tbody.appendChild(tr);
+        });
+
+        document.getElementById('statsTotalShowing').textContent = entities.length;
+        document.getElementById('statsTotalConfigured').textContent = allEntities.length;
+    }
+
+    function updateDashboardStats(entities) {
+        const total = entities.length;
+        const active = entities.filter(e => {
+            const s = (e.status || '').toUpperCase();
+            return s === 'RUNNING' || s === 'ACTIVE';
+        }).length;
+        const error = entities.filter(e => (e.status || '').toUpperCase() === 'ERROR').length;
+
+        document.querySelector('.summary-cards .card:nth-child(1) .card-value').textContent = total;
+        
+        const activeVal = document.querySelector('.summary-cards .card:nth-child(2) .card-value');
+        activeVal.textContent = active;
+        activeVal.style.color = active > 0 ? 'var(--status-running)' : 'var(--text-secondary)';
+        
+        const uptimePercent = total > 0 ? Math.round((active / total) * 100) : 0;
+        document.querySelector('.summary-cards .card:nth-child(2) .card-subtext').textContent = `${uptimePercent}% active`;
+        
+        // Global avg lag update placeholder
+        document.querySelector('.summary-cards .card:nth-child(4) .card-value').textContent = active > 0 ? '0.8s' : '-';
+        document.querySelector('.summary-cards .card:nth-child(4) .card-subtext').textContent = error > 0 ? `${error} with errors` : 'Healthy';
+    }
+
+    // Toggle Play/Pause API actions
+    async function toggleEntityReplication(entityName, isRunning) {
+        const action = isRunning ? 'stop' : 'start';
+        const row = document.querySelector(`tr[data-entity-name="${entityName}"]`);
+        if (!row) return;
+
+        const actionCell = row.querySelector('.action-cell');
+        actionCell.innerHTML = '<span class="mono-text">Wait...</span>';
+
+        try {
+            const res = await fetch(`${API_HOST}/api/pipelines/${selectedPipelineId}/entities/${entityName}/${action}`, {
+                method: 'POST'
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            
+            // Reload entities to fetch the updated state
+            await loadEntities(selectedPipelineId);
+        } catch (err) {
+            console.error(`Error trying to ${action} replication:`, err);
+            alert(`Replication command failed: ${err.message}`);
+            await loadEntities(selectedPipelineId);
+        }
+    }
+
+    // WebSockets Real-Time Stream
+    function connectWebSocket(pipelineId, entities) {
+        if (activeSocket) {
+            activeSocket.close();
+        }
+
+        const entityList = entities.map(e => e.entityName).join(',');
+        if (!entityList) return;
+
+        const socketUrl = `${WS_HOST}/ws/metrics?pipeline_id=${pipelineId}&entities=${encodeURIComponent(entityList)}`;
+        console.log("Connecting real-time telemetry:", socketUrl);
+
+        const ws = new WebSocket(socketUrl);
+        activeSocket = ws;
+
+        ws.onmessage = function(event) {
+            try {
+                const message = JSON.parse(event.data);
+                handleTelemetryMessage(message);
+            } catch (err) {
+                console.error("Protobuf JSON parsing error:", err);
+            }
+        };
+
+        ws.onclose = function() {
+            console.warn("WebSocket telemetry stream closed. Attempting reconnect in 5s...");
+            setTimeout(() => {
+                if (activeSocket === ws && selectedPipelineId === pipelineId) {
+                    connectWebSocket(pipelineId, entities);
+                }
+            }, 5000);
+        };
+    }
+
+    function handleTelemetryMessage(msg) {
+        const msgType = msg.Field_1_string;
+
+        if (msgType === "EntityStatusMessage") {
+            // EntityStatusMessage -> Field_2_message (content) -> Field_1_message (entitiesStatus list)
+            // Each EntityStatus: Field_2=entityId, Field_3=isMigrationActive,
+            //                    Field_4=isSyncActive, Field_5=isBusy
+            const content = msg.Field_2_message?.Field_1_message;
+            if (!content) return;
+
+            // Handle both list and single entity status
+            const items = content.Field_1_message_list || (content.Field_1_message ? [content.Field_1_message] : []);
+            items.forEach(item => {
+                if (!item) return;
+                const entityIdOrName = item.Field_2_string;
+                const isMigration = !!item.Field_3_varint;
+                const isSyncActive = !!item.Field_4_varint;
+                const isBusy = !!item.Field_5_varint;
+
+                const isRunning = isSyncActive;
+                const statusText = isSyncActive ? 'Active' : (isMigration ? 'Migration' : (isBusy ? 'Busy' : 'Pause'));
+                const statusClass = isSyncActive ? 'status-running' : (isBusy || isMigration ? 'status-busy' : 'status-stopped');
+
+                // Update local entities caches
+                const statusStr = isRunning ? 'RUNNING' : (isMigration ? 'MIGRATING' : (isBusy ? 'BUSY' : 'STOPPED'));
+                
+                if (typeof allEntities !== 'undefined' && Array.isArray(allEntities)) {
+                    const cachedEnt = allEntities.find(e => e.entityId === entityIdOrName || e.entityName === entityIdOrName);
+                    if (cachedEnt) {
+                        cachedEnt.status = statusStr;
+                    }
+                }
+                if (typeof verifyEntities !== 'undefined' && Array.isArray(verifyEntities)) {
+                    const cachedVerifyEnt = verifyEntities.find(e => e.entityId === entityIdOrName || e.entityName === entityIdOrName);
+                    if (cachedVerifyEnt) {
+                        cachedVerifyEnt.status = statusStr;
+                    }
+                }
+
+                // Update all matching rows in the DOM (both Entities List and Verify Tool tabs)
+                const rows = document.querySelectorAll(`tr[data-entity-id="${entityIdOrName}"], tr[data-entity-name="${entityIdOrName}"]`);
+                rows.forEach(row => {
+                    const badge = row.querySelector('.status-badge');
+                    const actionCell = row.querySelector('.action-cell');
+
+                    if (badge) {
+                        badge.className = `status-badge ${statusClass}`;
+                        badge.textContent = statusText;
+                    }
+                    if (actionCell) {
+                        actionCell.innerHTML = isRunning
+                            ? `<button class="btn-icon btn-pause" title="Pause Replication" onclick="toggleEntityReplication('${row.getAttribute('data-entity-name')}', true)">
+                                   <svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                               </button>`
+                            : `<button class="btn-icon btn-play" title="Start Replication" onclick="toggleEntityReplication('${row.getAttribute('data-entity-name')}', false)">
+                                   <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                               </button>`;
+                    }
+                });
+            });
+
+        } else if (msgType === "AgentInformationMessage") {
+            // AgentInformationMessage: Field_2_message (content) -> Field_1_message (agentInformation)
+            // AgentInformation: Field_1=agentId, Field_5=connectedDatabaseHost,
+            //   Field_6=connectedDatabaseName, Field_8=status(0=HEALTHY,1=UNHEALTHY),
+            //   Field_10=connectionStatus(0=CONNECTED,1=DISCONNECTED), Field_12=connectionError
+            const agentInfo = msg.Field_2_message?.Field_1_message;
+            if (!agentInfo) return;
+
+            const agentId = agentInfo.Field_1_string || '';
+            const dbHost = agentInfo.Field_5_string || '';
+            const dbName = agentInfo.Field_6_string || '';
+            const healthVal = agentInfo.Field_8_varint ?? -1;
+            const connVal = agentInfo.Field_10_varint ?? -1;
+            const connErr = agentInfo.Field_12_string || '';
+
+            const connStatus = connVal === 0 ? 'CONNECTED' : (connVal === 1 ? 'DISCONNECTED' : 'UNKNOWN');
+            const healthStatus = healthVal === 0 ? 'HEALTHY' : (healthVal === 1 ? 'UNHEALTHY' : 'UNKNOWN');
+            const isConn = connStatus === 'CONNECTED';
+            const isHealthy = healthStatus === 'HEALTHY';
+
+            const connColor = isConn ? 'var(--status-running)' : (connStatus === 'UNKNOWN' ? 'var(--text-secondary)' : 'var(--status-error)');
+            const connIcon = isConn ? '●' : (connStatus === 'UNKNOWN' ? '○' : '✕');
+            const label = isConn ? (isHealthy ? 'OK' : 'Degraded') : (connStatus === 'UNKNOWN' ? 'N/A' : 'Offline');
+            const tooltip = connErr
+                ? `${connStatus} — Error: ${connErr}`
+                : `${connStatus} / ${healthStatus}${dbHost ? ' — ' + dbHost : ''}${dbName ? '/' + dbName : ''}`;
+            const healthHtml = `<span class="db-health-badge" title="${tooltip}"
+                style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;font-weight:600;
+                       color:${connColor};cursor:default;">
+                <span style="font-size:0.7rem">${connIcon}</span>${label}
+            </span>`;
+
+            // Update ALL rows' health cell — agent health applies to all entities in the pipeline
+            // (same target DB for all entities)
+            document.querySelectorAll('td.agent-health-cell').forEach(cell => {
+                cell.innerHTML = healthHtml;
+            });
+
+        } else if (msgType === "MetricsMessage") {
+            const inner = msg.Field_2_message?.Field_1_message?.Field_1_message?.Field_2_message;
+            if (!inner) return;
+
+            const entityName = inner.Field_1_string;
+            const timestamp = inner.Field_2_varint;
+            const inserts = inner.Field_4_varint || 0;
+            const updates = inner.Field_5_varint || 0;
+            const deletes = inner.Field_6_varint || 0;
+            const totalOps = inner.Field_7_varint || 0;
+
+            const row = document.querySelector(`tr[data-entity-name="${entityName}"]`);
+            if (row) {
+                // Calculate throughput rate
+                const throughputCell = row.querySelector('.throughput');
+                const now = Date.now();
+                const prev = entityThroughputs[entityName] || { total: 0, time: now };
+                
+                const timeDiff = (now - prev.time) / 1000; // in seconds
+                const opsDiff = totalOps - prev.total;
+                const recsPerSec = timeDiff > 0.5 ? Math.max(0, Math.round(opsDiff / timeDiff)) : 0;
+
+                // Update rate cache
+                if (timeDiff > 0.5 || prev.total === 0) {
+                    entityThroughputs[entityName] = { total: totalOps, time: now };
+                }
+
+                throughputCell.innerHTML = `${recsPerSec.toLocaleString()} rec/s<span class="sub-text">${totalOps.toLocaleString()} total</span>`;
+
+                // Update replication heartbeat and last replication timestamp
+                const repCell = row.querySelector('.last-replication');
+                repCell.innerHTML = `${new Date().toLocaleTimeString()}<span class="sub-text">Just now</span>`;
+
+                // Update CDC Journal info
+                const journalCell = row.querySelector('.journal-seq');
+                if (journalCell) {
+                    journalCell.innerHTML = `<span class="mono-text">ACTIVE_CDC</span>`;
+                }
+
+                // Global lag calculation (simulate dynamic based on time drift or keep a low value)
+                const lagCell = row.querySelector('.lag');
+                if (lagCell) {
+                    lagCell.innerHTML = `<span class="mono-text">0s</span>`;
+                }
+
+                // Visual heartbeat animation (soft flash to indicate dynamic telemetry update)
+                row.classList.add('heartbeat-flash');
+                row.style.backgroundColor = 'rgba(59, 130, 246, 0.08)';
+                setTimeout(() => {
+                    row.style.backgroundColor = '';
+                    row.classList.remove('heartbeat-flash');
+                }, 250);
+            }
+        }
+    }
+
+    // Apply Filter Button
+    document.querySelector('.btn-apply').addEventListener('click', applyFiltersAndRender);
+
+    // ── Tab Navigation ──
+    function switchTab(tabName) {
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById(`tab-${tabName}`).classList.remove('hidden');
+        document.getElementById(`tab-btn-${tabName}`).classList.add('active');
+
+        // If switching to Verify tab and we have a pipeline selected, load its data
+        if (tabName === 'verify' && selectedPipelineId) {
+            console.log('[Tab] Switched to Verify tab, loading pipeline:', selectedPipelineId);
+            loadVerifyMetadata(selectedPipelineId).catch(err => {
+                console.error('[Tab] Error loading verify metadata:', err);
+            });
+        } else if (tabName === 'reports') {
+            console.log('[Tab] Switched to Reports tab, loading pipeline reports:', selectedPipelineId);
+            loadReports(selectedPipelineId).catch(err => {
+                console.error('[Tab] Error loading reports:', err);
+            });
+        }
+    }
+
+    // ── Reports History & Save Functions ──
+    let _allReports = []; // cache for filtering
+    let _reportsCurrentPage = 1;
+
+    function _parseReportTimestamp(utcStr) {
+        // utcStr = "YYYY-MM-DD HH:MM:SS ICT" (local timezone from backend)
+        if (!utcStr || utcStr === 'Unknown') return { local: utcStr, iso: '' };
+        try {
+            // Parse as local time (no Z suffix needed)
+            const parts = utcStr.split(' ')[0] + 'T' + utcStr.split(' ')[1];
+            const d = new Date(parts);
+            const local = d.toLocaleString(undefined, {
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit',
+                hour12: false
+            });
+            return { local, iso: parts };
+        } catch { return { local: utcStr, iso: '' }; }
+    }
+
+    async function loadReports(pipelineId) {
+        const tbody = document.getElementById('reportsTbody');
+        const label = document.getElementById('reportsStatusLabel');
+        const summaryBar = document.getElementById('reportsSummaryBar');
+        
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-secondary);padding:1.5rem">Loading report history...</td></tr>';
+        label.textContent = 'Loading...';
+        summaryBar.style.display = 'none';
+
+        try {
+            const search = document.getElementById('reportFilterText').value || '';
+            const status = document.getElementById('reportFilterStatus').value || '';
+            const fromDate = document.getElementById('reportFilterFrom').value || '';
+            const toDate = document.getElementById('reportFilterTo').value || '';
+
+            const params = new URLSearchParams();
+            if (pipelineId) params.append('pipeline_id', pipelineId);
+            if (search) params.append('search', search);
+            if (status) params.append('status', status);
+            if (fromDate) params.append('from_date', fromDate);
+            if (toDate) params.append('to_date', toDate);
+
+            const url = `${API_HOST}/api/reports?${params.toString()}`;
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            _allReports = await res.json();
+            _reportsCurrentPage = 1;
+            
+            const selectAllChk = document.getElementById('reportsSelectAll');
+            if (selectAllChk) selectAllChk.checked = false;
+
+            if (_allReports.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-secondary);padding:2rem">No reports saved yet or matched your search.</td></tr>';
+                label.textContent = 'No reports found';
+                document.getElementById('reportsPaginationContainer').style.display = 'none';
+                updateBulkDeleteBtn();
+                return;
+            }
+            label.textContent = `${_allReports.length} report(s) loaded`;
+            renderReportRows(_allReports);
+        } catch (err) {
+            console.error('Error loading reports:', err);
+            tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--status-error);padding:1.5rem">Error: ${err.message}</td></tr>`;
+            label.textContent = 'Error loading reports';
+            document.getElementById('reportsPaginationContainer').style.display = 'none';
+            updateBulkDeleteBtn();
+        }
+    }
+
+    function renderReportRows(reports) {
+        const tbody = document.getElementById('reportsTbody');
+        const summaryBar = document.getElementById('reportsSummaryBar');
+        tbody.innerHTML = '';
+
+        if (!reports.length) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-secondary);padding:2rem">No matching reports.</td></tr>';
+            summaryBar.style.display = 'none';
+            document.getElementById('reportsPaginationContainer').style.display = 'none';
+            return;
+        }
+
+        let passCount = 0, failCount = 0;
+        reports.forEach(rep => {
+            if (rep.summary_status === 'pass') passCount++;
+            else if (rep.summary_status === 'fail') failCount++;
+        });
+
+        // Client-side pagination
+        const pageSize = parseInt(document.getElementById('rowsPerPage')?.value) || 25;
+        const totalReports = reports.length;
+        const totalPages = Math.ceil(totalReports / pageSize) || 1;
+        if (_reportsCurrentPage > totalPages) _reportsCurrentPage = totalPages;
+        if (_reportsCurrentPage < 1) _reportsCurrentPage = 1;
+        
+        const startIndex = (_reportsCurrentPage - 1) * pageSize;
+        const endIndex = Math.min(startIndex + pageSize, totalReports);
+        const paginatedReports = reports.slice(startIndex, endIndex);
+
+        document.getElementById('reportsShowingCount').textContent = `${totalReports > 0 ? startIndex + 1 : 0}-${endIndex}`;
+        document.getElementById('reportsTotalCount').textContent = totalReports;
+        
+        const paginationContainer = document.getElementById('reportsPaginationContainer');
+        if (totalReports > pageSize) {
+            paginationContainer.style.display = 'flex';
+            renderReportsPagination(totalPages);
+        } else {
+            paginationContainer.style.display = 'none';
+        }
+
+        paginatedReports.forEach(rep => {
+            const sizeKb = (rep.size_bytes / 1024).toFixed(1);
+            const reportUrl = `${API_HOST}${rep.url}`;
+            const name = rep.pipeline_name || pipelineNames[rep.pipeline_id] || rep.pipeline_id;
+            const { local } = _parseReportTimestamp(rep.created_at);
+            const entityCount = rep.entity_count || 0;
+            
+            const summaryHtml = rep.summary_status === 'pass'
+                ? '<span style="color:var(--status-running);font-weight:600">✓ All In Sync</span>'
+                : rep.summary_status === 'fail'
+                    ? '<span style="color:var(--status-error);font-weight:600">✗ Has Diff</span>'
+                    : '<span style="color:var(--text-secondary);font-size:0.8rem">—</span>';
+
+            const tr = document.createElement('tr');
+            tr.setAttribute('data-report-pipeline', rep.pipeline_id);
+            tr.setAttribute('data-report-status', rep.summary_status || '');
+            tr.setAttribute('data-report-timestamp', rep.created_at);
+            tr.innerHTML = `
+                <td style="text-align: center;"><input type="checkbox" class="report-row-chk" data-pipeline="${rep.pipeline_id}" data-filename="${rep.filename}" onchange="updateBulkDeleteBtn()"></td>
+                <td><span class="mono-text">${name}</span></td>
+                <td><strong>${local}</strong></td>
+                <td><span class="mono-text">${entityCount}</span></td>
+                <td>${summaryHtml}</td>
+                <td><span class="mono-text">${sizeKb} KB</span></td>
+                <td>
+                    <div style="display:flex; gap:0.5rem; align-items:center;">
+                        <a href="${reportUrl}" target="_blank"
+                           style="display:inline-block; padding:0.35rem 0.85rem; border-radius:6px;
+                                  background:var(--accent-blue); color:#fff; font-size:0.8rem;
+                                  font-weight:600; text-decoration:none; white-space:nowrap;
+                                  transition:opacity 0.15s;" onmouseover="this.style.opacity=.8" onmouseout="this.style.opacity=1">
+                            Open ↗
+                        </a>
+                        <button onclick="deleteSingleReport('${rep.pipeline_id}', '${rep.filename}')" class="btn-icon btn-pause" style="padding: 0.35rem; border-radius: 6px; border: 1px solid var(--border-color); display: inline-flex; align-items: center; justify-content: center; background: transparent; color: var(--status-error); cursor: pointer;" title="Delete Report">
+                            <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                        </button>
+                    </div>
+                </td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        summaryBar.style.display = 'flex';
+        document.getElementById('reportsSummaryTotal').textContent = `📄 ${reports.length} report(s)`;
+        document.getElementById('reportsSummaryPass').textContent = passCount ? `✓ ${passCount} Pass` : '';
+        document.getElementById('reportsSummaryFail').textContent = failCount ? `✗ ${failCount} Fail` : '';
+        
+        updateBulkDeleteBtn();
+    }
+
+    function renderReportsPagination(totalPages) {
+        const pagDiv = document.getElementById('reportsPagination');
+        pagDiv.innerHTML = '';
+
+        const prevBtn = document.createElement('button');
+        prevBtn.className = 'page-btn page-btn-wide';
+        prevBtn.textContent = 'Previous';
+        prevBtn.disabled = _reportsCurrentPage === 1;
+        prevBtn.onclick = () => {
+            if (_reportsCurrentPage > 1) {
+                _reportsCurrentPage--;
+                renderReportRows(_allReports);
+            }
+        };
+        pagDiv.appendChild(prevBtn);
+
+        const maxVisible = 5;
+        let startPage = Math.max(1, _reportsCurrentPage - Math.floor(maxVisible / 2));
+        let endPage = Math.min(totalPages, startPage + maxVisible - 1);
+        if (endPage - startPage + 1 < maxVisible) {
+            startPage = Math.max(1, endPage - maxVisible + 1);
+        }
+
+        for (let i = startPage; i <= endPage; i++) {
+            const btn = document.createElement('button');
+            btn.className = `page-btn ${i === _reportsCurrentPage ? 'active' : ''}`;
+            btn.textContent = i;
+            btn.onclick = () => {
+                _reportsCurrentPage = i;
+                renderReportRows(_allReports);
+            };
+            pagDiv.appendChild(btn);
+        }
+
+        const nextBtn = document.createElement('button');
+        nextBtn.className = 'page-btn page-btn-wide';
+        nextBtn.textContent = 'Next';
+        nextBtn.disabled = _reportsCurrentPage === totalPages;
+        nextBtn.onclick = () => {
+            if (_reportsCurrentPage < totalPages) {
+                _reportsCurrentPage++;
+                renderReportRows(_allReports);
+            }
+        };
+        pagDiv.appendChild(nextBtn);
+    }
+
+    window.toggleSelectAllReports = function(checked) {
+        const chks = document.querySelectorAll('.report-row-chk');
+        chks.forEach(chk => chk.checked = checked);
+        updateBulkDeleteBtn();
+    };
+
+    window.updateBulkDeleteBtn = function() {
+        const chks = document.querySelectorAll('.report-row-chk:checked');
+        const btn = document.getElementById('btnBulkDeleteReports');
+        if (btn) {
+            if (chks.length > 0) {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                btn.textContent = `🗑 Delete Selected (${chks.length})`;
+            } else {
+                btn.disabled = true;
+                btn.style.opacity = '0.5';
+                btn.textContent = `🗑 Delete Selected`;
+            }
+        }
+        
+        const allChks = document.querySelectorAll('.report-row-chk');
+        const selectAllChk = document.getElementById('reportsSelectAll');
+        if (selectAllChk && allChks.length > 0) {
+            selectAllChk.checked = (chks.length === allChks.length);
+        }
+    };
+
+    window.deleteSingleReport = async function(pipelineId, filename) {
+        if (!confirm(`Are you sure you want to delete report:\n${filename}?`)) {
+            return;
+        }
+        try {
+            const res = await fetch(`${API_HOST}/api/reports/${pipelineId}/${filename}`, {
+                method: 'DELETE'
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            await loadReports(selectedPipelineId);
+        } catch (err) {
+            console.error('Error deleting report:', err);
+            alert(`Failed to delete report: ${err.message}`);
+        }
+    };
+
+    window.deleteSelectedReports = async function() {
+        const chks = document.querySelectorAll('.report-row-chk:checked');
+        if (chks.length === 0) return;
+        if (!confirm(`Are you sure you want to delete ${chks.length} selected report(s)?`)) {
+            return;
+        }
+
+        const reportsToDelete = Array.from(chks).map(chk => ({
+            pipeline_id: chk.getAttribute('data-pipeline'),
+            filename: chk.getAttribute('data-filename')
+        }));
+
+        try {
+            const res = await fetch(`${API_HOST}/api/reports/delete-bulk`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reports: reportsToDelete })
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            await loadReports(selectedPipelineId);
+        } catch (err) {
+            console.error('Error deleting bulk reports:', err);
+            alert(`Failed to delete selected reports: ${err.message}`);
+        }
+    };
+
+    function filterReportHistory() {
+        loadReports(selectedPipelineId);
+    }
+
+    async function saveVerifyReport() {
+        if (!selectedPipelineId) {
+            alert('Please select a pipeline first.');
+            return;
+        }
+
+        const saveBtn = document.getElementById('btnSaveVerify');
+        const label = document.getElementById('verifyStatusLabel');
+        const originalHtml = saveBtn.innerHTML;
+
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = 'Saving...';
+
+        try {
+            const res = await fetch(`${API_HOST}/api/verify/${selectedPipelineId}/save`, { method: 'POST' });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            
+            label.textContent = `✓ Report saved to history folder successfully!`;
+            saveBtn.innerHTML = 'Saved ✓';
+            setTimeout(() => {
+                saveBtn.disabled = false;
+                saveBtn.innerHTML = originalHtml;
+                saveBtn.style.display = 'none'; // Hide it after successful save
+            }, 3000);
+            
+            // Pre-load the reports list so it's fresh if they switch tabs
+            loadReports(selectedPipelineId).catch(() => {});
+        } catch (err) {
+            console.error('Error saving report:', err);
+            alert(`Failed to save report: ${err.message}`);
+            saveBtn.disabled = false;
+            saveBtn.innerHTML = originalHtml;
+        }
+    }
+
+    // ── Verify Tool ──
+    let verifyEntities = [];
+
+    // Helper functions for Select All verify checkboxes
+    window.toggleAllVerifyCheckboxes = function(checked) {
+        document.querySelectorAll('.verify-entity-checkbox').forEach(cb => {
+            if (!cb.disabled) {
+                cb.checked = checked;
+            }
+        });
+    };
+
+    window.updateSelectAllVerifyHeader = function() {
+        const checkboxes = document.querySelectorAll('.verify-entity-checkbox');
+        const checkedCount = document.querySelectorAll('.verify-entity-checkbox:checked').length;
+        const selectAll = document.getElementById('selectAllVerify');
+        if (selectAll) {
+            selectAll.checked = checkedCount === checkboxes.length;
+            selectAll.indeterminate = checkedCount > 0 && checkedCount < checkboxes.length;
+        }
+    };
+
+    async function loadVerifyMetadata(pipelineId) {
+        console.log('[Verify] loadVerifyMetadata called with pipelineId:', pipelineId);
+        
+        if (!pipelineId) {
+            console.log('[Verify] pipelineId is empty, returning early');
+            return;
+        }
+        
+        const tbody = document.getElementById('verifyTbody');
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-secondary);padding:1.5rem">Loading entity metadata...</td></tr>';
+        console.log('[Verify] Showing loading state');
+
+        try {
+            const url = `${API_HOST}/api/pipelines/${pipelineId}/entities`;
+            console.log('[Verify] Fetching entities from:', url);
+            
+            const res = await fetch(url);
+            console.log('[Verify] API response status:', res.status);
+            
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            
+            verifyEntities = await res.json();
+            console.log('[Verify] Received', verifyEntities.length, 'entities');
+            
+            renderVerifyMetadata(verifyEntities);
+            console.log('[Verify] Metadata rendered successfully');
+        } catch (err) {
+            console.error('[Verify] ERROR loading metadata:', err);
+            tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--status-error);padding:1.5rem">Error loading entities: ${err.message}</td></tr>`;
+        }
+    }
+
+    function renderVerifyMetadata(entities) {
+        const tbody = document.getElementById('verifyTbody');
+        tbody.innerHTML = '';
+
+        if (!entities || entities.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-secondary);padding:2rem">This pipeline has no entities configured</td></tr>';
+            document.getElementById('verifyStatusLabel').textContent = 'No entities to verify';
+            console.log('[Verify] No entities to render');
+            return;
+        }
+
+        // Reset the select all header
+        const selectAll = document.getElementById('selectAllVerify');
+        if (selectAll) {
+            selectAll.checked = true;
+            selectAll.indeterminate = false;
+            selectAll.disabled = false;
+        }
+
+        entities.forEach(ent => {
+            const srcAgent = ent.agentEntities?.[0] || null;
+            const tgtAgent = ent.agentEntities?.[1] || null;
+            const srcTable = srcAgent ? `${srcAgent.table?.schema || ''}.${srcAgent.table?.name || ''}` : '-';
+            const tgtTable = tgtAgent ? `${tgtAgent.table?.schema || ''}.${tgtAgent.table?.name || ''}` : '-';
+
+            // Determine status badge
+            const status = (ent.status || 'STOPPED').toUpperCase();
+            let statusClass = 'status-stopped';
+            let statusText = 'Pause';
+            if (status === 'RUNNING' || status === 'ACTIVE') {
+                statusClass = 'status-running';
+                statusText = 'Active';
+            } else if (status === 'ERROR') {
+                statusClass = 'status-error';
+                statusText = 'Error';
+            }
+
+            const tr = document.createElement('tr');
+            tr.dataset.entityId = ent.entityId;
+            tr.dataset.entityName = ent.entityName;
+            tr.innerHTML = `
+                <td style="text-align: center;"><input type="checkbox" class="verify-entity-checkbox" data-entity="${ent.entityName}" checked onchange="updateSelectAllVerifyHeader()"></td>
+                <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                <td><strong>${ent.entityName}</strong></td>
+                <td><span class="mono-text">${srcTable}</span></td>
+                <td class="src-count-cell" data-entity="${ent.entityName}"><span class="val-loading">—</span></td>
+                <td><span class="mono-text">${tgtTable}</span></td>
+                <td class="tgt-count-cell" data-entity="${ent.entityName}"><span class="val-loading">—</span></td>
+                <td class="diff-cell" data-entity="${ent.entityName}"><span class="val-loading">—</span></td>
+                <td class="vstatus-cell" data-entity="${ent.entityName}"><span class="val-loading">—</span></td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        document.getElementById('verifyStatusLabel').textContent = 'Metadata loaded — click Run to execute counts';
+    }
+
+    async function runVerification() {
+        if (!selectedPipelineId) {
+            alert('Please select a pipeline first.');
+            return;
+        }
+        const btn = document.getElementById('btnRunVerify');
+        const label = document.getElementById('verifyStatusLabel');
+        btn.disabled = true;
+        label.textContent = 'Starting job...';
+
+        // Ensure metadata is loaded first
+        if (verifyEntities.length === 0) {
+            await loadVerifyMetadata(selectedPipelineId);
+        }
+
+        // Hide save button on new run
+        document.getElementById('btnSaveVerify').style.display = 'none';
+
+        // 1. Disable all checkboxes during run
+        document.querySelectorAll('.verify-entity-checkbox').forEach(cb => cb.disabled = true);
+        const selectAll = document.getElementById('selectAllVerify');
+        if (selectAll) selectAll.disabled = true;
+
+        // 2. Identify selected (non-skipped) entities
+        const selectedCheckboxes = Array.from(document.querySelectorAll('.verify-entity-checkbox:checked'));
+        const selectedEntities = selectedCheckboxes.map(cb => cb.dataset.entity);
+        const skippedCheckboxes = Array.from(document.querySelectorAll('.verify-entity-checkbox:not(:checked)'));
+
+        // Reset all rows
+        document.querySelectorAll('.src-count-cell, .tgt-count-cell, .diff-cell, .vstatus-cell').forEach(cell => {
+            cell.innerHTML = '<span class="val-loading">—</span>';
+        });
+
+        // 3. Instantly mark unchecked ones as "Skipped" in the UI
+        skippedCheckboxes.forEach(cb => {
+            const name = cb.dataset.entity;
+            const srcCell  = document.querySelector(`.src-count-cell[data-entity="${name}"]`);
+            const tgtCell  = document.querySelector(`.tgt-count-cell[data-entity="${name}"]`);
+            const diffCell = document.querySelector(`.diff-cell[data-entity="${name}"]`);
+            const vCell    = document.querySelector(`.vstatus-cell[data-entity="${name}"]`);
+            
+            if (srcCell) srcCell.innerHTML = '<span style="color: var(--text-secondary); font-style: italic;">Skipped</span>';
+            if (tgtCell) tgtCell.innerHTML = '<span style="color: var(--text-secondary); font-style: italic;">Skipped</span>';
+            if (diffCell) diffCell.innerHTML = '<span style="color: var(--text-secondary); font-style: italic;">—</span>';
+            if (vCell) vCell.innerHTML = '<span class="mode-badge mode-none">SKIPPED</span>';
+        });
+
+        if (selectedEntities.length === 0) {
+            label.textContent = 'Error: No entities selected to verify.';
+            btn.disabled = false;
+            document.querySelectorAll('.verify-entity-checkbox').forEach(cb => cb.disabled = false);
+            if (selectAll) selectAll.disabled = false;
+            return;
+        }
+
+        try {
+            // 4. Start the async job with JSON body of selected entities
+            const startRes = await fetch(`${API_HOST}/api/verify/${selectedPipelineId}/run`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ entities: selectedEntities })
+            });
+            
+            if (!startRes.ok) throw new Error(`Start failed: HTTP ${startRes.status}`);
+            const job = await startRes.json();
+            label.textContent = `Running... 0 / ${job.total} complete`;
+            btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> Running...';
+
+            // 5. Poll /results every 2s and update table rows as they arrive
+            let lastSeen = 0;
+            const pollInterval = setInterval(async () => {
+                try {
+                    const res = await fetch(`${API_HOST}/api/verify/${selectedPipelineId}/results`);
+                    if (!res.ok) return;
+                    const state = await res.json();
+
+                    // Update only new results since last poll
+                    const newResults = state.results.slice(lastSeen);
+                    newResults.forEach(r => applyVerifyResult(r));
+                    lastSeen = state.results.length;
+
+                    label.textContent = `Running... ${state.done_count} / ${state.total} complete`;
+
+                    if (state.status === 'done') {
+                        clearInterval(pollInterval);
+                        const ts = new Date().toLocaleTimeString();
+                        label.textContent = `✓ Done at ${ts} — ${state.total} entities checked`;
+                        btn.disabled = false;
+                        btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg> Run Verification';
+                        
+                        // Re-enable checkboxes
+                        document.querySelectorAll('.verify-entity-checkbox').forEach(cb => cb.disabled = false);
+                        if (selectAll) selectAll.disabled = false;
+                        
+                        // Show save button when finished
+                        document.getElementById('btnSaveVerify').style.display = 'inline-flex';
+                    }
+                } catch (e) {
+                    console.error('Poll error:', e);
+                }
+            }, 2000);
+
+        } catch (err) {
+            label.textContent = `Error: ${err.message}`;
+            btn.disabled = false;
+            btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg> Run Verification';
+            document.querySelectorAll('.verify-entity-checkbox').forEach(cb => cb.disabled = false);
+            if (selectAll) selectAll.disabled = false;
+        }
+    }
+
+    function applyVerifyResult(r) {
+        const srcCell  = document.querySelector(`.src-count-cell[data-entity="${r.entity_name}"]`);
+        const tgtCell  = document.querySelector(`.tgt-count-cell[data-entity="${r.entity_name}"]`);
+        const diffCell = document.querySelector(`.diff-cell[data-entity="${r.entity_name}"]`);
+        const vCell    = document.querySelector(`.vstatus-cell[data-entity="${r.entity_name}"]`);
+        if (!srcCell) return;
+
+        const srcCount = r.source_count != null ? r.source_count.toLocaleString() : 'N/A';
+        const srcTs    = r.source_last_ts || '—';
+        const tgtCount = r.target_count != null ? r.target_count.toLocaleString() : 'N/A';
+        const tgtTs    = r.target_last_ts || '—';
+
+        srcCell.innerHTML = `<strong>${srcCount}</strong><br><span style="font-size:0.72rem;color:var(--text-secondary)">${srcTs}</span>`;
+        tgtCell.innerHTML = `<strong>${tgtCount}</strong><br><span style="font-size:0.72rem;color:var(--text-secondary)">${tgtTs}</span>`;
+
+        if (r.error && r.target_count == null) {
+            tgtCell.innerHTML = `<span class="val-err" title="${r.error}">Error</span>`;
+            diffCell.innerHTML = '<span class="val-loading">—</span>';
+            vCell.innerHTML    = `<span class="val-err" title="${r.error}">⚠ Error</span>`;
+        } else if (r.diff == null) {
+            diffCell.innerHTML = '<span class="val-loading">N/A</span>';
+            vCell.innerHTML    = '<span class="val-loading">—</span>';
+        } else {
+            const diffClass = r.diff === 0 ? 'diff-ok' : (Math.abs(r.diff) < 100 ? 'diff-warn' : 'diff-err');
+            diffCell.innerHTML = `<span class="${diffClass}">${r.diff > 0 ? '+' : ''}${r.diff.toLocaleString()}</span>`;
+            const vClass = r.diff === 0 ? 'val-ok' : (Math.abs(r.diff) < 100 ? 'val-warn' : 'val-err');
+            const vText  = r.diff === 0 ? '✓ IN SYNC' : (Math.abs(r.diff) < 100 ? '⚠ MINOR GAP' : '✗ OUT OF SYNC');
+            vCell.innerHTML = `<span class="${vClass}">${vText}</span>`;
+        }
+    }
+
+
+    // ── Scheduler & Profiling Modal Logic ──
+    window.openSettingsModal = function() {
+        const modal = document.getElementById('settingsModal');
+        modal.style.display = 'flex';
+        modal.classList.remove('hidden');
+        switchSettingsTab('jobs');
+        loadAllSettingsData();
+    };
+
+    window.closeSettingsModal = function() {
+        const modal = document.getElementById('settingsModal');
+        modal.style.display = 'none';
+        modal.classList.add('hidden');
+    };
+
+    window.switchSettingsTab = function(tabName) {
+        document.querySelectorAll('.settings-tab-panel').forEach(p => p.classList.add('hidden'));
+        document.querySelectorAll('.side-tab-btn').forEach(b => b.classList.remove('active'));
+        
+        document.getElementById(`settings-tab-${tabName}`).classList.remove('hidden');
+        document.getElementById(`btn-stab-${tabName}`).classList.add('active');
+        
+        if (tabName === 'logs') {
+            loadSchedulerLogs();
+        }
+    };
+
+    async function loadAllSettingsData() {
+        await loadSchedulerJobs();
+        await loadReportProfiles();
+        await loadMailerProfiles();
+        await loadGlobalConfig();
+        await populatePipelineDropdowns();
+    }
+
+    async function loadGlobalConfig() {
+        try {
+            const res = await fetch(`${API_HOST}/api/settings`);
+            if (res.ok) {
+                const settings = await res.json();
+                document.getElementById('settingsLogPath').value = settings.log_path || '/app/replica-mon/cache/scheduler.log';
+            }
+        } catch (err) {
+            console.error('Error loading settings:', err);
+        }
+    }
+
+    window.saveGlobalSettings = async function() {
+        const logPath = document.getElementById('settingsLogPath').value;
+        try {
+            const res = await fetch(`${API_HOST}/api/settings`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ log_path: logPath })
+            });
+            if (res.ok) {
+                alert('Global settings saved successfully.');
+            } else {
+                throw new Error('Failed to save');
+            }
+        } catch (err) {
+            alert('Error saving settings: ' + err.message);
+        }
+    };
+
+    // ── JOBS MANAGEMENT ──
+    let _allJobs = [];
+    let _pipelinesCache = [];
+
+    async function populatePipelineDropdowns() {
+        try {
+            const res = await fetch(`${API_HOST}/api/pipelines`);
+            if (res.ok) {
+                _pipelinesCache = await res.json();
+                
+                const jobPipeSelect = document.getElementById('jobPipelineSelect');
+                const rpPipeSelect = document.getElementById('reportProfilePipelineSelect');
+                
+                jobPipeSelect.innerHTML = '<option value="">-- Select Pipeline --</option>';
+                rpPipeSelect.innerHTML = '<option value="">-- Select Pipeline --</option>';
+                
+                _pipelinesCache.forEach(p => {
+                    const id = p.pipelineId || p.id;
+                    const name = p.name || id;
+                    jobPipeSelect.innerHTML += `<option value="${id}">${name}</option>`;
+                    rpPipeSelect.innerHTML += `<option value="${id}">${name}</option>`;
+                });
+            }
+        } catch (err) {
+            console.error('Error populating pipelines:', err);
+        }
+    }
+
+    let _editingJobId = null;
+
+    async function loadSchedulerJobs() {
+        const tbody = document.getElementById('jobsTbody');
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:1rem;">Loading jobs...</td></tr>';
+        try {
+            const res = await fetch(`${API_HOST}/api/scheduler/jobs`);
+            if (res.ok) {
+                _allJobs = await res.json();
+                tbody.innerHTML = '';
+                if (_allJobs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);padding:1rem;">No jobs configured yet.</td></tr>';
+                    return;
+                }
+                _allJobs.forEach(job => {
+                    const tr = document.createElement('tr');
+                    const enabledChecked = job.enabled ? 'checked' : '';
+                    tr.innerHTML = `
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color);">
+                            <label class="switch">
+                                <input type="checkbox" ${enabledChecked} onchange="toggleJob(${job.id}, this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                        </td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color);"><strong>${job.name}</strong><br><span style="font-size:0.7rem;color:var(--text-secondary)">Pipeline: ${job.pipeline_id}</span></td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); font-family:monospace;">${job.cron_expression}</td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); font-size:0.75rem;">
+                            Report: <strong>${job.report_profile_name || 'None'}</strong><br>
+                            Mail: <strong>${job.mailer_profile_name || 'None'}</strong>
+                        </td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); text-align:right;">
+                            <button onclick="editJob(${job.id})" style="padding:0.25rem 0.5rem; border-radius:4px; border:none; background:var(--accent-blue); color:#fff; font-size:0.75rem; cursor:pointer; margin-right:0.25rem;">Edit</button>
+                            <button onclick="deleteJob(${job.id})" style="padding:0.25rem 0.5rem; border-radius:4px; border:none; background:var(--status-error); color:#fff; font-size:0.75rem; cursor:pointer;">Delete</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+        } catch (err) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--status-error);padding:1rem;">Error loading jobs.</td></tr>';
+        }
+    }
+
+    function getCronDescription(cron) {
+        if (!cron) return 'Please enter a cron expression';
+        const parts = cron.trim().split(/\s+/);
+        if (parts.length !== 5) return 'Invalid cron format (must be 5 space-separated parts)';
+        const [m, h, dom, mon, dow] = parts;
+        
+        let desc = '';
+        
+        // 1. Time (Minute & Hour)
+        if (m === '*' && h === '*') {
+            desc = 'Every minute';
+        } else if (m.startsWith('*/') && h === '*') {
+            desc = `Every ${m.split('/')[1]} minutes`;
+        } else if (m === '0' && h === '*') {
+            desc = 'Every hour at minute 0';
+        } else if (m === '0' && h.startsWith('*/')) {
+            desc = `Every ${h.split('/')[1]} hours (at minute 0)`;
+        } else if (!m.includes('*') && !h.includes('*') && !m.includes(',') && !h.includes(',')) {
+            desc = `Daily at ${h.padStart(2, '0')}:${m.padStart(2, '0')}`;
+        } else {
+            desc = `At minute ${m} of hour ${h}`;
+        }
+        
+        // 2. Day of Week / Month rule
+        if (dom === '*' && dow === '*') {
+            if (!desc.startsWith('Every minute') && !desc.startsWith('Every')) {
+                desc += ' every day';
+            }
+        } else if (dom === '*' && dow !== '*') {
+            if (dow === '1-5') {
+                desc += ' on weekdays';
+            } else if (dow === '0,6' || dow === '6,0') {
+                desc += ' on weekends';
+            } else {
+                const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+                const list = dow.split(',').map(d => {
+                    if (d.includes('-')) {
+                        const [s, e] = d.split('-').map(Number);
+                        return `${days[s] || s} through ${days[e] || e}`;
+                    }
+                    return days[Number(d)] || d;
+                });
+                desc += ' on ' + list.join(', ');
+            }
+        } else if (dom !== '*' && dow === '*') {
+            desc += ` on day ${dom} of the month`;
+        } else {
+            desc += ` on day ${dom} of month and day of week ${dow}`;
+        }
+        
+        // 3. Month
+        if (mon !== '*') {
+            desc += ` in month ${mon}`;
+        }
+        
+        return desc;
+    }
+
+    window.updateCronFromSplit = function() {
+        const min = document.getElementById('cronMin').value.trim() || '*';
+        const hour = document.getElementById('cronHour').value.trim() || '*';
+        const dom = document.getElementById('cronDom').value.trim() || '*';
+        const month = document.getElementById('cronMonth').value.trim() || '*';
+        const dow = document.getElementById('cronDow').value.trim() || '*';
+        const combined = `${min} ${hour} ${dom} ${month} ${dow}`;
+        document.getElementById('cronExpressionInput').value = combined;
+        document.getElementById('cronHumanReadable').textContent = getCronDescription(combined);
+    };
+
+    window.showCreateJobForm = function() {
+        _editingJobId = null;
+        document.getElementById('jobFormContainer').style.display = 'block';
+        document.getElementById('jobFormContainer').querySelector('h4').innerText = 'New Scheduler Job';
+        document.getElementById('jobNameInput').value = '';
+        document.getElementById('jobPipelineSelect').value = '';
+        document.getElementById('jobReportProfileSelect').innerHTML = '<option value="">-- Choose Pipeline First --</option>';
+        document.getElementById('jobMailerProfileSelect').value = '';
+        document.getElementById('cronPresetSelect').value = '';
+        
+        // Reset split inputs
+        document.getElementById('cronMin').value = '*';
+        document.getElementById('cronHour').value = '*';
+        document.getElementById('cronDom').value = '*';
+        document.getElementById('cronMonth').value = '*';
+        document.getElementById('cronDow').value = '*';
+        updateCronFromSplit();
+    };
+
+    window.editJob = async function(id) {
+        const job = _allJobs.find(j => j.id === id);
+        if (!job) return;
+        
+        _editingJobId = id;
+        
+        const formContainer = document.getElementById('jobFormContainer');
+        formContainer.style.display = 'block';
+        formContainer.querySelector('h4').innerText = 'Edit Scheduler Job';
+        formContainer.scrollIntoView({ behavior: 'smooth' });
+        
+        document.getElementById('jobNameInput').value = job.name;
+        document.getElementById('jobPipelineSelect').value = job.pipeline_id;
+        
+        // Load dropdowns based on pipeline
+        await loadProfilesForPipelineSelection(job.pipeline_id);
+        
+        document.getElementById('jobReportProfileSelect').value = job.report_profile_id;
+        document.getElementById('jobMailerProfileSelect').value = job.mailer_profile_id;
+        
+        // Handle cron preset/split inputs matching
+        const cronExpr = job.cron_expression || '* * * * *';
+        const parts = cronExpr.split(' ');
+        if (parts.length === 5) {
+            document.getElementById('cronMin').value = parts[0];
+            document.getElementById('cronHour').value = parts[1];
+            document.getElementById('cronDom').value = parts[2];
+            document.getElementById('cronMonth').value = parts[3];
+            document.getElementById('cronDow').value = parts[4];
+        }
+        updateCronFromSplit();
+        document.getElementById('cronPresetSelect').value = '';
+    };
+
+    window.cancelCreateJob = function() {
+        document.getElementById('jobFormContainer').style.display = 'none';
+        _editingJobId = null;
+    };
+
+    window.loadProfilesForPipelineSelection = async function(pipelineId) {
+        const rpSelect = document.getElementById('jobReportProfileSelect');
+        if (!pipelineId) {
+            rpSelect.innerHTML = '<option value="">-- Choose Pipeline First --</option>';
+            return;
+        }
+        rpSelect.innerHTML = '<option value="">Loading...</option>';
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/report?pipeline_id=${pipelineId}`);
+            if (res.ok) {
+                const profiles = await res.json();
+                rpSelect.innerHTML = '<option value="">-- Select Report Profile --</option>';
+                profiles.forEach(p => {
+                    rpSelect.innerHTML += `<option value="${p.id}">${p.name}</option>`;
+                });
+            }
+        } catch (err) {
+            rpSelect.innerHTML = '<option value="">Error loading profiles</option>';
+        }
+        
+        const mpSelect = document.getElementById('jobMailerProfileSelect');
+        mpSelect.innerHTML = '<option value="">Loading...</option>';
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/mailer`);
+            if (res.ok) {
+                const profiles = await res.json();
+                mpSelect.innerHTML = '<option value="">-- Select Mailer Profile --</option>';
+                profiles.forEach(p => {
+                    mpSelect.innerHTML += `<option value="${p.id}">${p.name}</option>`;
+                });
+            }
+        } catch (err) {
+            mpSelect.innerHTML = '<option value="">Error loading mailers</option>';
+        }
+    };
+
+    window.applyCronPreset = function(val) {
+        if (!val) return;
+        const parts = val.split(' ');
+        if (parts.length === 5) {
+            document.getElementById('cronMin').value = parts[0];
+            document.getElementById('cronHour').value = parts[1];
+            document.getElementById('cronDom').value = parts[2];
+            document.getElementById('cronMonth').value = parts[3];
+            document.getElementById('cronDow').value = parts[4];
+            updateCronFromSplit();
+        }
+    };
+
+    window.saveSchedulerJob = async function() {
+        const name = document.getElementById('jobNameInput').value;
+        const pipelineId = document.getElementById('jobPipelineSelect').value;
+        const reportProfileId = document.getElementById('jobReportProfileSelect').value;
+        const mailerProfileId = document.getElementById('jobMailerProfileSelect').value;
+        const cronExpr = document.getElementById('cronExpressionInput').value;
+
+        if (!name || !pipelineId || !reportProfileId || !mailerProfileId || !cronExpr) {
+            alert('Please fill out all fields for the job.');
+            return;
+        }
+
+        const payload = {
+            name,
+            pipeline_id: pipelineId,
+            cron_expression: cronExpr,
+            report_profile_id: parseInt(reportProfileId),
+            mailer_profile_id: parseInt(mailerProfileId),
+            enabled: true
+        };
+        if (_editingJobId !== null) {
+            payload.id = _editingJobId;
+        }
+
+        try {
+            const res = await fetch(`${API_HOST}/api/scheduler/jobs`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+                document.getElementById('jobFormContainer').style.display = 'none';
+                _editingJobId = null;
+                loadSchedulerJobs();
+            } else {
+                throw new Error('Failed to save job');
+            }
+        } catch (err) {
+            alert('Error: ' + err.message);
+        }
+    };
+
+    window.toggleJob = async function(jobId, enabled) {
+        try {
+            await fetch(`${API_HOST}/api/scheduler/jobs/${jobId}/toggle?enabled=${enabled}`, {
+                method: 'POST'
+            });
+        } catch (err) {
+            console.error('Error toggling job:', err);
+        }
+    };
+
+    window.deleteJob = async function(jobId) {
+        if (!confirm('Are you sure you want to delete this job?')) return;
+        try {
+            const res = await fetch(`${API_HOST}/api/scheduler/jobs/${jobId}`, {
+                method: 'DELETE'
+            });
+            if (res.ok) {
+                loadSchedulerJobs();
+            }
+        } catch (err) {
+            console.error('Error deleting job:', err);
+        }
+    };
+
+    // ── REPORT PROFILES MANAGEMENT ──
+    let _allReportProfiles = [];
+    let _rpExpandedPages = {}; // profileId -> pageNumber
+    let _editingReportProfileId = null;
+
+    async function loadReportProfiles() {
+        const tbody = document.getElementById('reportProfilesTbody');
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:1rem;">Loading profiles...</td></tr>';
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/report`);
+            if (res.ok) {
+                _allReportProfiles = await res.json();
+                tbody.innerHTML = '';
+                if (_allReportProfiles.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);padding:1rem;">No profiles configured.</td></tr>';
+                    return;
+                }
+                _allReportProfiles.forEach(p => {
+                    let entitiesHtml = '';
+                    if (p.entities && p.entities.length > 0) {
+                        entitiesHtml = `
+                            <span id="rp-preview-${p.id}">
+                                <strong>${p.entities.length} entities</strong>
+                                <span style="color:var(--accent-blue); font-weight:600; cursor:pointer; text-decoration:underline; margin-left:0.5rem;" onclick="toggleProfileEntitiesExpand(${p.id})">👁 Expand</span>
+                            </span>
+                            <div id="rp-full-${p.id}" style="display:none; width:220px; max-width:220px; padding:0.5rem; background:rgba(0,0,0,0.15); border:1px solid var(--border-color); border-radius:6px; margin-top:0.25rem; box-sizing:border-box;">
+                                <div id="rp-expanded-list-${p.id}"></div>
+                                <div style="margin-top:0.5rem; text-align:right;">
+                                    <span style="color:var(--status-error); font-weight:600; cursor:pointer; text-decoration:underline; font-size:0.7rem;" onclick="toggleProfileEntitiesExpand(${p.id})">Collapse</span>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        entitiesHtml = '<span style="color:var(--text-secondary); font-style:italic;">None</span>';
+                    }
+
+                    const pipeName = pipelineNames[p.pipeline_id] || p.pipeline_id;
+
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color);"><strong>${p.name}</strong></td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); font-weight:600; color:var(--accent-blue);">${pipeName}</td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); font-size:0.75rem; max-width:240px; width:240px;">${entitiesHtml}</td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); font-size:0.8rem; color:var(--text-secondary);">
+                            ${p.skip_if_all_pass ? '✓ Skip if sync' : 'Always send'}
+                        </td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); text-align:right;">
+                            <button onclick="editReportProfile(${p.id})" style="padding:0.25rem 0.5rem; border-radius:4px; border:none; background:var(--accent-blue); color:#fff; font-size:0.75rem; cursor:pointer; margin-right:0.25rem;">Edit</button>
+                            <button onclick="deleteReportProfile(${p.id})" style="padding:0.25rem 0.5rem; border-radius:4px; border:none; background:var(--status-error); color:#fff; font-size:0.75rem; cursor:pointer;">Delete</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+        } catch (err) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--status-error);padding:1rem;">Error loading profiles.</td></tr>';
+        }
+    }
+
+    // Pagination selection variables for new report profile form
+    let _rpSelectorEntities = [];      // Array of string entity names
+    let _rpSelectorFiltered = [];      // Filtered entity names
+    let _rpSelectorSelected = new Set(); // Set of selected entity names
+    let _rpSelectorPage = 1;
+    const RP_SELECTOR_PAGE_SIZE = 10;
+
+    window.showCreateReportProfileForm = function() {
+        _editingReportProfileId = null;
+        document.getElementById('reportProfileFormContainer').style.display = 'block';
+        document.getElementById('reportProfileFormContainer').querySelector('h4').innerText = 'New Report Profile';
+        document.getElementById('reportProfileNameInput').value = '';
+        document.getElementById('reportProfilePipelineSelect').value = '';
+        document.getElementById('reportProfileEntitiesList').innerHTML = '<span style="color:var(--text-secondary); font-size:0.8rem; font-style:italic;">Choose a pipeline first...</span>';
+        document.getElementById('reportProfileSkipMail').checked = false;
+        
+        // Reset state
+        _rpSelectorEntities = [];
+        _rpSelectorFiltered = [];
+        _rpSelectorSelected = new Set();
+        _rpSelectorPage = 1;
+
+        // Reset search/bulk actions/pagination controls
+        document.getElementById('reportProfileEntitySearch').style.display = 'none';
+        document.getElementById('reportProfileEntitySearch').value = '';
+        document.getElementById('reportProfileEntityActions').style.display = 'none';
+        document.getElementById('rpSelectorPagination').style.display = 'none';
+    };
+
+    window.editReportProfile = async function(id) {
+        const profile = _allReportProfiles.find(p => p.id === id);
+        if (!profile) return;
+        
+        _editingReportProfileId = id;
+        
+        const formContainer = document.getElementById('reportProfileFormContainer');
+        formContainer.style.display = 'block';
+        formContainer.querySelector('h4').innerText = 'Edit Report Profile';
+        formContainer.scrollIntoView({ behavior: 'smooth' });
+        
+        document.getElementById('reportProfileNameInput').value = profile.name;
+        document.getElementById('reportProfilePipelineSelect').value = profile.pipeline_id;
+        
+        // Load entity selector checkboxes for this pipeline
+        await loadReportProfileEntities(profile.pipeline_id);
+        
+        // Restore selected checkboxes
+        _rpSelectorSelected = new Set(profile.entities);
+        renderRpSelectorPage();
+        
+        document.getElementById('reportProfileSkipMail').checked = profile.skip_if_all_pass;
+    };
+
+    window.cancelCreateReportProfile = function() {
+        document.getElementById('reportProfileFormContainer').style.display = 'none';
+        _editingReportProfileId = null;
+    };
+
+    window.loadReportProfileEntities = async function(pipelineId) {
+        const listDiv = document.getElementById('reportProfileEntitiesList');
+        const searchInput = document.getElementById('reportProfileEntitySearch');
+        const actionsDiv = document.getElementById('reportProfileEntityActions');
+        const paginationDiv = document.getElementById('rpSelectorPagination');
+        
+        if (!pipelineId) {
+            listDiv.innerHTML = '<span style="color:var(--text-secondary); font-size:0.8rem; font-style:italic;">Choose a pipeline first...</span>';
+            searchInput.style.display = 'none';
+            actionsDiv.style.display = 'none';
+            paginationDiv.style.display = 'none';
+            return;
+        }
+        listDiv.innerHTML = '<span style="color:var(--text-secondary); font-size:0.85rem;">Loading entity list...</span>';
+        searchInput.style.display = 'none';
+        actionsDiv.style.display = 'none';
+        paginationDiv.style.display = 'none';
+        
+        try {
+            const res = await fetch(`${API_HOST}/api/pipelines/${pipelineId}/entities`);
+            if (res.ok) {
+                const entities = await res.json();
+                
+                // Initialize State
+                _rpSelectorEntities = entities.map(ent => ent.entityName);
+                _rpSelectorFiltered = [..._rpSelectorEntities];
+                _rpSelectorSelected = new Set(_rpSelectorEntities); // select all by default
+                _rpSelectorPage = 1;
+                
+                if (_rpSelectorEntities.length === 0) {
+                    listDiv.innerHTML = '<span style="color:var(--text-secondary); font-size:0.8rem; font-style:italic;">No entities in pipeline config.</span>';
+                    return;
+                }
+                
+                // Render Page
+                renderRpSelectorPage();
+                
+                // Show actions, search, and pagination
+                searchInput.style.display = 'block';
+                searchInput.value = '';
+                actionsDiv.style.display = 'flex';
+                paginationDiv.style.display = 'flex';
+            }
+        } catch (err) {
+            listDiv.innerHTML = '<span style="color:var(--status-error); font-size:0.8rem;">Error loading entities list.</span>';
+        }
+    };
+
+    window.renderRpSelectorPage = function() {
+        const listDiv = document.getElementById('reportProfileEntitiesList');
+        listDiv.innerHTML = '';
+        
+        const totalItems = _rpSelectorFiltered.length;
+        const totalPages = Math.ceil(totalItems / RP_SELECTOR_PAGE_SIZE) || 1;
+        
+        if (_rpSelectorPage < 1) _rpSelectorPage = 1;
+        if (_rpSelectorPage > totalPages) _rpSelectorPage = totalPages;
+        
+        const startIndex = (_rpSelectorPage - 1) * RP_SELECTOR_PAGE_SIZE;
+        const endIndex = Math.min(startIndex + RP_SELECTOR_PAGE_SIZE, totalItems);
+        const pageItems = _rpSelectorFiltered.slice(startIndex, endIndex);
+        
+        if (pageItems.length === 0) {
+            listDiv.innerHTML = '<span style="color:var(--text-secondary); font-size:0.8rem; font-style:italic;">No matching entities.</span>';
+            document.getElementById('rpSelectPageNum').innerText = `Page 1 of 1`;
+            document.getElementById('rpSelectPrevBtn').disabled = true;
+            document.getElementById('rpSelectNextBtn').disabled = true;
+            return;
+        }
+        
+        pageItems.forEach(entName => {
+            const div = document.createElement('div');
+            div.className = 'profile-entity-item';
+            div.style.display = 'flex';
+            div.style.alignItems = 'center';
+            div.style.gap = '0.5rem';
+            div.style.marginBottom = '0.3rem';
+            
+            const isChecked = _rpSelectorSelected.has(entName);
+            div.innerHTML = `
+                <input type="checkbox" class="profile-entity-checkbox" value="${entName}" id="rp-ent-${entName}" style="cursor:pointer;" ${isChecked ? 'checked' : ''} onchange="toggleRpSelectorEntity('${entName}', this.checked)">
+                <label for="rp-ent-${entName}" style="font-size:0.85rem; color:var(--text-primary); cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${entName}</label>
+            `;
+            listDiv.appendChild(div);
+        });
+        
+        // Update pagination buttons & state text
+        document.getElementById('rpSelectPageNum').innerText = `Page ${_rpSelectorPage} of ${totalPages}`;
+        document.getElementById('rpSelectPrevBtn').disabled = (_rpSelectorPage === 1);
+        document.getElementById('rpSelectNextBtn').disabled = (_rpSelectorPage === totalPages);
+        
+        // Update selection count
+        document.getElementById('reportProfileSelectedCount').innerText = _rpSelectorSelected.size;
+        document.getElementById('reportProfileTotalCount').innerText = _rpSelectorEntities.length;
+    };
+
+    window.toggleRpSelectorEntity = function(entName, isChecked) {
+        if (isChecked) {
+            _rpSelectorSelected.add(entName);
+        } else {
+            _rpSelectorSelected.delete(entName);
+        }
+        document.getElementById('reportProfileSelectedCount').innerText = _rpSelectorSelected.size;
+    };
+
+    window.changeRpSelectorPage = function(delta) {
+        _rpSelectorPage += delta;
+        renderRpSelectorPage();
+    };
+
+    window.filterReportProfileEntities = function(query) {
+        const lower = query.toLowerCase().trim();
+        const isWildcard = lower.endsWith('*');
+        const baseQuery = isWildcard ? lower.slice(0, -1) : lower;
+        
+        _rpSelectorFiltered = _rpSelectorEntities.filter(entName => {
+            const label = entName.toLowerCase();
+            if (isWildcard) {
+                return label.startsWith(baseQuery);
+            }
+            return label.includes(baseQuery);
+        });
+        
+        _rpSelectorPage = 1;
+        renderRpSelectorPage();
+    };
+
+    window.selectAllReportProfileEntities = function(check) {
+        _rpSelectorFiltered.forEach(entName => {
+            if (check) {
+                _rpSelectorSelected.add(entName);
+            } else {
+                _rpSelectorSelected.delete(entName);
+            }
+        });
+        renderRpSelectorPage();
+    };
+
+    window.toggleProfileEntitiesExpand = function(profileId) {
+        const preview = document.getElementById(`rp-preview-${profileId}`);
+        const full = document.getElementById(`rp-full-${profileId}`);
+        if (full.style.display === 'none') {
+            full.style.display = 'block';
+            preview.style.display = 'none';
+            renderRpExpandedEntities(profileId, 1);
+        } else {
+            full.style.display = 'none';
+            preview.style.display = 'inline';
+        }
+    };
+
+    window.renderRpExpandedEntities = function(profileId, page) {
+        const profile = _allReportProfiles.find(p => p.id === profileId);
+        if (!profile) return;
+        
+        const PAGE_SIZE = 10;
+        const totalPages = Math.ceil(profile.entities.length / PAGE_SIZE) || 1;
+        if (page < 1) page = 1;
+        if (page > totalPages) page = totalPages;
+        
+        _rpExpandedPages[profileId] = page;
+        
+        const startIndex = (page - 1) * PAGE_SIZE;
+        const endIndex = Math.min(startIndex + PAGE_SIZE, profile.entities.length);
+        const pageEntities = profile.entities.slice(startIndex, endIndex);
+        
+        const listDiv = document.getElementById(`rp-expanded-list-${profileId}`);
+        if (!listDiv) return;
+        
+        let html = `<div style="display:flex; flex-direction:column; gap:0.3rem; font-family:monospace; font-size:0.7rem; max-height:150px; overflow-y:auto; overflow-x:auto; margin-bottom:0.4rem; padding-right:0.25rem;">`;
+        pageEntities.forEach(ent => {
+            html += `<div style="color:var(--text-primary); white-space:nowrap; line-height:1.2;">• ${ent}</div>`;
+        });
+        html += `</div>`;
+        
+        // Add footer controls
+        html += `
+            <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.68rem; color:var(--text-secondary); border-top:1px solid var(--border-color); padding-top:0.25rem; box-sizing:border-box;">
+                <button type="button" onclick="changeRpExpandedPage(${profileId}, -1)" ${page === 1 ? 'disabled' : ''} style="background:none; border:1px solid var(--border-color); border-radius:3px; color:var(--text-primary); cursor:pointer; padding:1px 4px; font-size:0.65rem;">Prev</button>
+                <span>Page ${page} of ${totalPages}</span>
+                <button type="button" onclick="changeRpExpandedPage(${profileId}, 1)" ${page === totalPages ? 'disabled' : ''} style="background:none; border:1px solid var(--border-color); border-radius:3px; color:var(--text-primary); cursor:pointer; padding:1px 4px; font-size:0.65rem;">Next</button>
+            </div>
+        `;
+        listDiv.innerHTML = html;
+    };
+
+    window.changeRpExpandedPage = function(profileId, delta) {
+        const currentPage = _rpExpandedPages[profileId] || 1;
+        renderRpExpandedEntities(profileId, currentPage + delta);
+    };
+
+    window.saveReportProfile = async function() {
+        const name = document.getElementById('reportProfileNameInput').value;
+        const pipelineId = document.getElementById('reportProfilePipelineSelect').value;
+        const skipIfAllPass = document.getElementById('reportProfileSkipMail').checked;
+        
+        const entities = Array.from(_rpSelectorSelected);
+
+        if (!name || !pipelineId || entities.length === 0) {
+            alert('Please fill name, pipeline, and select at least one entity.');
+            return;
+        }
+
+        const payload = {
+            name,
+            pipeline_id: pipelineId,
+            entities,
+            skip_if_all_pass: skipIfAllPass
+        };
+        if (_editingReportProfileId !== null) {
+            payload.id = _editingReportProfileId;
+        }
+
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/report`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+                document.getElementById('reportProfileFormContainer').style.display = 'none';
+                _editingReportProfileId = null;
+                loadReportProfiles();
+            } else {
+                throw new Error('Failed to save profile');
+            }
+        } catch (err) {
+            alert('Error: ' + err.message);
+        }
+    };
+
+    window.deleteReportProfile = async function(id) {
+        if (!confirm('Are you sure you want to delete this profile?')) return;
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/report/${id}`, {
+                method: 'DELETE'
+            });
+            if (res.ok) {
+                loadReportProfiles();
+            }
+        } catch (err) {
+            console.error('Error deleting profile:', err);
+        }
+    };
+
+    // ── MAILER PROFILES MANAGEMENT ──
+    let _allMailerProfiles = [];
+    let _editingMailerProfileId = null;
+
+    async function loadMailerProfiles() {
+        const tbody = document.getElementById('mailerProfilesTbody');
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:1rem;">Loading mailer profiles...</td></tr>';
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/mailer`);
+            if (res.ok) {
+                _allMailerProfiles = await res.json();
+                tbody.innerHTML = '';
+                if (_allMailerProfiles.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-secondary);padding:1rem;">No mailers configured.</td></tr>';
+                    return;
+                }
+                _allMailerProfiles.forEach(m => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color);"><strong>${m.name}</strong></td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); font-size:0.8rem;">${m.emails}</td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); font-size:0.8rem;">${m.subject}</td>
+                        <td style="padding:0.5rem; border-bottom:1px solid var(--border-color); text-align:right;">
+                            <button onclick="editMailerProfile(${m.id})" style="padding:0.25rem 0.5rem; border-radius:4px; border:none; background:var(--accent-blue); color:#fff; font-size:0.75rem; cursor:pointer; margin-right:0.25rem;">Edit</button>
+                            <button onclick="deleteMailerProfile(${m.id})" style="padding:0.25rem 0.5rem; border-radius:4px; border:none; background:var(--status-error); color:#fff; font-size:0.75rem; cursor:pointer;">Delete</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+        } catch (err) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--status-error);padding:1rem;">Error loading mailer profiles.</td></tr>';
+        }
+    }
+
+    window.showCreateMailerProfileForm = function() {
+        _editingMailerProfileId = null;
+        const formContainer = document.getElementById('mailerProfileFormContainer');
+        formContainer.style.display = 'block';
+        formContainer.querySelector('h4').innerText = 'New Mailer Profile';
+        document.getElementById('mailerProfileName').value = '';
+        document.getElementById('mailerProfileEmails').value = '';
+        document.getElementById('mailerProfileSubject').value = '';
+        document.getElementById('mailerProfileBodyHeader').value = '';
+        document.getElementById('mailerProfileBodyEnding').value = '';
+    };
+
+    window.editMailerProfile = function(id) {
+        const mailer = _allMailerProfiles.find(m => m.id === id);
+        if (!mailer) return;
+
+        _editingMailerProfileId = id;
+        const formContainer = document.getElementById('mailerProfileFormContainer');
+        formContainer.style.display = 'block';
+        formContainer.querySelector('h4').innerText = 'Edit Mailer Profile';
+        formContainer.scrollIntoView({ behavior: 'smooth' });
+
+        document.getElementById('mailerProfileName').value = mailer.name || '';
+        document.getElementById('mailerProfileEmails').value = mailer.emails || '';
+        document.getElementById('mailerProfileSubject').value = mailer.subject || '';
+        document.getElementById('mailerProfileBodyHeader').value = mailer.body_header || '';
+        document.getElementById('mailerProfileBodyEnding').value = mailer.body_ending || '';
+    };
+
+    window.cancelCreateMailerProfile = function() {
+        document.getElementById('mailerProfileFormContainer').style.display = 'none';
+        _editingMailerProfileId = null;
+    };
+
+    window.saveMailerProfile = async function() {
+        const name = document.getElementById('mailerProfileName').value;
+        const emails = document.getElementById('mailerProfileEmails').value;
+        const subject = document.getElementById('mailerProfileSubject').value;
+        const bodyHeader = document.getElementById('mailerProfileBodyHeader').value;
+        const bodyEnding = document.getElementById('mailerProfileBodyEnding').value;
+
+        if (!name || !emails || !subject) {
+            alert('Please fill out Name, Recipient Emails, and Subject Template.');
+            return;
+        }
+
+        const payload = {
+            name,
+            emails,
+            subject,
+            body_header: bodyHeader,
+            body_ending: bodyEnding
+        };
+        if (_editingMailerProfileId !== null) {
+            payload.id = _editingMailerProfileId;
+        }
+
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/mailer`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+                document.getElementById('mailerProfileFormContainer').style.display = 'none';
+                _editingMailerProfileId = null;
+                loadMailerProfiles();
+            } else {
+                throw new Error('Failed to save mailer profile');
+            }
+        } catch (err) {
+            alert('Error: ' + err.message);
+        }
+    };
+
+    window.deleteMailerProfile = async function(id) {
+        if (!confirm('Are you sure you want to delete this mailer profile?')) return;
+        try {
+            const res = await fetch(`${API_HOST}/api/profiles/mailer/${id}`, {
+                method: 'DELETE'
+            });
+            if (res.ok) {
+                loadMailerProfiles();
+            }
+        } catch (err) {
+            console.error('Error deleting mailer profile:', err);
+        }
+    };
+
+    // ── LOGS LOADER ──
+    window.loadSchedulerLogs = async function() {
+        const logsDiv = document.getElementById('schedulerLogsContent');
+        logsDiv.textContent = 'Loading logs...';
+        try {
+            const res = await fetch(`${API_HOST}/api/scheduler/logs?lines=60`);
+            if (res.ok) {
+                const logs = await res.json();
+                if (logs.length === 0) {
+                    logsDiv.textContent = 'No logs registered in log file yet. Execute scheduler tasks or check config path.';
+                    return;
+                }
+                logsDiv.textContent = logs.join('\n');
+                logsDiv.scrollTop = logsDiv.scrollHeight;
+            } else {
+                logsDiv.textContent = 'Failed to load logs from server.';
+            }
+        } catch (err) {
+            logsDiv.textContent = 'Error: ' + err.message;
+        }
+    };
+
+
+    // Initial Bootstrap
+    window.addEventListener('DOMContentLoaded', () => {
+        loadPipelines();
+        
+        const rowsPerPageSelect = document.getElementById('rowsPerPage');
+        if (rowsPerPageSelect) {
+            rowsPerPageSelect.addEventListener('change', () => {
+                const reportsTab = document.getElementById('tab-reports');
+                if (reportsTab && !reportsTab.classList.contains('hidden')) {
+                    _reportsCurrentPage = 1;
+                    renderReportRows(_allReports);
+                }
+            });
+        }
+    });
+</script>
+
+</body>
+</html>

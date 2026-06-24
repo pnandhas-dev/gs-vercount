@@ -1,0 +1,998 @@
+"""Journal Commands Module.
+
+This module contains all journal-related CLI commands:
+- journal check: Check journal status for a table
+- journal disable: Disable journaling on tables
+- journal enable: Enable journaling on tables
+- journal entries: View journal entries
+- journal list: List journals in a library
+- journal receivers: List journal receivers
+- journal cleanup: Clean up old journal receivers
+- journal monitor: Monitor journal health
+- journal info: Get detailed journal information
+- journal create-receiver: Create a new journal receiver
+- journal rollover: Perform journal receiver rollover
+- journal create: Create a new journal
+- journal last-txn: Get last transaction sequence and timestamp for table(s)
+"""
+
+import sys
+import logging
+from datetime import datetime
+from typing import Optional
+
+import click
+from rich.console import Console
+from rich.text import Text
+
+from ..config import load_config
+from ..db.connection import AS400ConnectionManager, ConnectionError
+from ..db.journal import JournalManager
+from ..utils.formatters import print_table, print_json_clean
+from .utils import print_panel
+
+EPOCH_START = datetime(1, 1, 1)
+
+
+def _dt_to_dotnet_ticks(dt: datetime) -> int:
+    """Convert Python datetime to .NET ticks (100-nanosecond intervals since 0001-01-01)."""
+    return int((dt - EPOCH_START).total_seconds() * 10_000_000)
+
+console = Console()
+
+
+@click.group()
+def journal():
+    """Journal management commands."""
+    pass
+
+
+@journal.command("check")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_check(ctx: click.Context, table: str, library: str, output_format: str) -> None:
+    """Check journal status for a table."""
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output
+    if output_format == "json":
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            info = jrn.get_journal_info(table, library)
+            
+            if output_format == "json":
+                print_json_clean(info.get_summary())
+            else:
+                status_color = "green" if info.is_journaled else "yellow"
+                print_panel(
+                    ctx,
+                    Text.assemble(
+                        ("Table: ", "bold"), f"{library}.{table}", "\n",
+                        ("Journaled: ", "bold"), ("Yes" if info.is_journaled else "No", status_color), "\n",
+                        ("Journal: ", "bold"), (f"{info.journal_library}.{info.journal_name}" if info.journal_library and info.journal_name else "N/A"), "\n",
+                        ("Receiver: ", "bold"), (f"{info.journal_receiver_library}.{info.journal_receiver_name}" if info.journal_receiver_library and info.journal_receiver_name else "N/A"), "\n",
+                        ("Entry Range: ", "bold"), 
+                        (f"{info.oldest_entry_sequence} - {info.newest_entry_sequence}" if info.oldest_entry_sequence and info.newest_entry_sequence else "N/A"),
+                    ),
+                    title="Journal Information",
+                    border_style=status_color
+                )
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("disable")
+@click.option("--table", "-t", required=True, help="Table name (supports wildcards: * or %)")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--dry-run", is_flag=True, help="Show which tables would be affected without making changes")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_disable(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    dry_run: bool,
+    output_format: str
+) -> None:
+    """Disable journaling for one or more tables.
+    
+    Supports wildcards:
+      - * or % for multiple characters
+      - ? or _ for single character
+    
+    Examples:
+      qadmcli journal disable -t TB_01 -l EZPIPE
+      qadmcli journal disable -t "TB_*" -l EZPIPE
+      qadmcli journal disable -t "%TEST%" -l MYLIB --dry-run
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Check if wildcard pattern (* and ? are shell-style, % is SQL-style)
+            # Note: _ is a valid character in IBM i table names, not a wildcard
+            if '*' in table or '%' in table or '?' in table:
+                # Find matching tables
+                from ..db.schema import SchemaManager
+                import fnmatch
+                schema_mgr = SchemaManager(conn)
+                all_tables = schema_mgr.list_tables(library)
+                
+                # Filter tables by pattern (convert SQL wildcards to fnmatch pattern)
+                pattern = name.replace('%', '*').replace('_', '?')
+                tables = [t for t in all_tables if fnmatch.fnmatch(t.name, pattern)]
+                
+                if not tables:
+                    console.print(f"[yellow]No tables matching pattern '{table}' in {library}[/yellow]")
+                    return
+                
+                if dry_run:
+                    console.print(f"[blue]Dry run - would disable journaling for {len(tables)} table(s):[/blue]")
+                    for table in tables:
+                        console.print(f"  - {table.name}")
+                    return
+                
+                # Process each table
+                results = []
+                success_count = 0
+                error_count = 0
+                
+                console.print(f"[blue]Disabling journaling for {len(tables)} table(s)...[/blue]")
+                for table in tables:
+                    try:
+                        result = jrn.disable_journaling(table.name, library)
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": True
+                        })
+                        success_count += 1
+                        console.print(f"  [green]OK[/green] {library}.{table.name}")
+                    except Exception as e:
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": False,
+                            "error": str(e)
+                        })
+                        error_count += 1
+                        console.print(f"  [red]ERR[/red] {library}.{table.name}: {e}")
+                
+                if output_format == "json":
+                    print_json_clean({
+                        "operation": "disable",
+                        "pattern": name,
+                        "library": library,
+                        "total": len(tables),
+                        "success": success_count,
+                        "errors": error_count,
+                        "results": results
+                    })
+                else:
+                    console.print(f"\n[green]Completed: {success_count} succeeded, {error_count} failed[/green]")
+            else:
+                # Single table
+                if dry_run:
+                    console.print(f"[blue]Dry run - would disable journaling for {library}.{table}[/blue]")
+                    return
+                
+                result = jrn.disable_journaling(table, library)
+                
+                if output_format == "json":
+                    print_json_clean(result)
+                else:
+                    console.print(f"[green]Disabled journaling for {library}.{table}[/green]")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("enable")
+@click.option("--table", "-t", required=True, help="Table name (supports wildcards: * or %)")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--journal-library", "-j", help="Journal library (default from config)")
+@click.option("--journal-name", help="Journal name (default from config)")
+@click.option("--images", "-i", type=click.Choice(["*BOTH", "*AFTER", "*BEFORE"]), 
+              default="*AFTER", help="Journal images to capture (default: *AFTER)")
+@click.option("--dry-run", is_flag=True, help="Show which tables would be affected without making changes")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_enable(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    journal_library: str | None,
+    journal_name: str | None,
+    images: str,
+    dry_run: bool,
+    output_format: str
+) -> None:
+    """Enable journaling for one or more tables.
+    
+    Supports wildcards:
+      - * or % for multiple characters
+      - ? or _ for single character
+    
+    Examples:
+      qadmcli journal enable -t TB_01 -l EZPIPE
+      qadmcli journal enable -t "TB_*" -l EZPIPE --images *BOTH
+      qadmcli journal enable -t "%TEST%" -l MYLIB -j MYLIB --dry-run
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Check if wildcard pattern (* and ? are shell-style, % is SQL-style)
+            # Note: _ is a valid character in IBM i table names, not a wildcard
+            if '*' in table or '%' in table or '?' in table:
+                # Find matching tables
+                from ..db.schema import SchemaManager
+                import fnmatch
+                schema_mgr = SchemaManager(conn)
+                all_tables = schema_mgr.list_tables(library)
+                
+                # Filter tables by pattern (convert SQL wildcards to fnmatch pattern)
+                pattern = name.replace('%', '*').replace('_', '?')
+                tables = [t for t in all_tables if fnmatch.fnmatch(t.name, pattern)]
+                
+                if not tables:
+                    console.print(f"[yellow]No tables matching pattern '{table}' in {library}[/yellow]")
+                    return
+                
+                if dry_run:
+                    console.print(f"[blue]Dry run - would enable journaling for {len(tables)} table(s):[/blue]")
+                    for table in tables:
+                        console.print(f"  - {table.name} (images: {images})")
+                    return
+                
+                # Process each table
+                results = []
+                success_count = 0
+                error_count = 0
+                
+                console.print(f"[blue]Enabling journaling for {len(tables)} table(s) with {images}...[/blue]")
+                for table in tables:
+                    try:
+                        result = jrn.enable_journaling(table.name, library, journal_library, journal_name, images)
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": True,
+                            "journal": result['journal']
+                        })
+                        success_count += 1
+                        console.print(f"  [green]OK[/green] {library}.{table.name} -> {result['journal']}")
+                    except Exception as e:
+                        results.append({
+                            "table": f"{library}.{table.name}",
+                            "success": False,
+                            "error": str(e)
+                        })
+                        error_count += 1
+                        console.print(f"  [red]ERR[/red] {library}.{table.name}: {e}")
+                
+                if output_format == "json":
+                    print_json_clean({
+                        "operation": "enable",
+                        "pattern": name,
+                        "library": library,
+                        "images": images,
+                        "total": len(tables),
+                        "success": success_count,
+                        "errors": error_count,
+                        "results": results
+                    })
+                else:
+                    console.print(f"\n[green]Completed: {success_count} succeeded, {error_count} failed[/green]")
+                    console.print(f"Images mode: {images}")
+            else:
+                # Single table
+                if dry_run:
+                    console.print(f"[blue]Dry run - would enable journaling for {library}.{table} with {images}[/blue]")
+                    return
+                
+                result = jrn.enable_journaling(table, library, journal_library, journal_name, images)
+                
+                if output_format == "json":
+                    print_json_clean(result)
+                else:
+                    console.print(f"[green]Enabled journaling for {library}.{table}[/green]")
+                    console.print(f"Journal: {result['journal']}")
+                    console.print(f"Images: {images}")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("entries")
+@click.option("--table", "-t", required=True, help="Table name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--limit", default=100, help="Number of entries to retrieve (default: 100)")
+@click.option("--from-time", help="Filter entries from timestamp (ISO 8601: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)")
+@click.option("--to-time", help="Filter entries to timestamp (ISO 8601: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)")
+@click.option("--format", "output_format", type=click.Choice(["sql", "json", "summary"]), default="sql", help="Output format")
+@click.pass_context
+def journal_entries(
+    ctx: click.Context,
+    table: str,
+    library: str,
+    limit: int,
+    from_time: str | None,
+    to_time: str | None,
+    output_format: str
+) -> None:
+    """Get journal entries for a table.
+    
+    Use --format summary to get operation counts (useful for comparison with MSSQL CT).
+    """
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output to keep it clean
+    if output_format in ("json", "summary"):
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            if output_format == "summary":
+                # Get summary only
+                summary = jrn.get_journal_summary(table, library, from_time, to_time)
+                print_json_clean(summary)
+            else:
+                # Get full entries
+                entries = jrn.get_journal_entries(
+                    table, library, 
+                    limit=limit,
+                    from_time=from_time,
+                    to_time=to_time
+                )
+                
+                if output_format == "json":
+                    data = [e.model_dump() for e in entries]
+                    print_json_clean(data)
+                else:
+                    # SQL format
+                    if not entries:
+                        console.print("[yellow]No journal entries found for this table.[/yellow]")
+                    else:
+                        for entry in entries:
+                            sql = entry.to_sql()
+                            if sql:
+                                console.print(f"-- Entry {entry.entry_number} ({entry.operation}) at {entry.entry_timestamp}")
+                                console.print(f"{sql}\n")
+                            else:
+                                # Show entry info even if SQL can't be generated
+                                console.print(f"-- Entry {entry.entry_number} ({entry.entry_type or 'Unknown'}) at {entry.entry_timestamp}")
+                                console.print(f"-- Job: {entry.job_name}, User: {entry.job_user}, Program: {entry.program_name}")
+                                if entry.raw_entry_data:
+                                    console.print(f"-- Raw data: {entry.raw_entry_data[:100]}...\n")
+                                else:
+                                    console.print("-- No data available\n")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("list")
+@click.option("--library", "-l", help="Filter by library name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_list(ctx: click.Context, library: str | None, output_format: str) -> None:
+    """List all journals with their sizes and status."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            from ..db.journal import JournalManager
+            jrn = JournalManager(conn)
+            journals = jrn.list_journals(library)
+            
+            if output_format == "json":
+                print_json_clean([j.model_dump() for j in journals])
+            else:
+                if journals:
+                    rows = []
+                    for j in journals:
+                        # Determine size category
+                        total_entries = j.get('total_entries', 0) or 0
+                        if total_entries < 10000:
+                            size_cat = "[green]Small[/green]"
+                        elif total_entries < 1000000:
+                            size_cat = "[yellow]Medium[/yellow]"
+                        else:
+                            size_cat = "[red]Large[/red]"
+                        
+                        rows.append([
+                            f"{j['journal_library']}.{j['journal_name']}",
+                            str(j.get('receiver_count', 0)),
+                            f"{total_entries:,}" if total_entries else "N/A",
+                            size_cat,
+                            j.get('attached_receiver', 'N/A') or 'N/A'
+                        ])
+                    
+                    console.print(print_table(
+                        console,
+                        ["Journal", "Receivers", "Total Entries", "Size", "Current Receiver"],
+                        rows,
+                        title="Journal List"
+                    ))
+                else:
+                    console.print("[yellow]No journals found[/yellow]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("receivers")
+@click.option("--journal", "-j", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_receivers(ctx: click.Context, journal: str, library: str, output_format: str) -> None:
+    """Show journal receiver chain with cleanup recommendations."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            receivers = jrn.get_receiver_chain(journal, library)
+            
+            if output_format == "json":
+                print_json_clean(receivers)
+            else:
+                if receivers:
+                    rows = []
+                    for r in receivers:
+                        status_icon = "🟢" if r['status'] == 'ATTACHED' else "🔵" if r['status'] == 'ONLINE' else "⚪"
+                        cleanup = "[red]KEEP (Attached)[/red]" if r['status'] == 'ATTACHED' else "[green]Safe to cleanup[/green]"
+                        rows.append([
+                            r['receiver_name'],
+                            r['status'],
+                            f"{r['entries']:,}" if r['entries'] else "N/A",
+                            f"{r['size_mb']:.2f} MB" if r['size_mb'] else "N/A",
+                            cleanup
+                        ])
+                    
+                    console.print(print_table(
+                        console,
+                        ["Receiver", "Status", "Entries", "Size", "Cleanup Status"],
+                        rows,
+                        title=f"Journal Receivers: {library}.{journal}"
+                    ))
+                    
+                    # Summary
+                    total_receivers = len(receivers)
+                    attached = sum(1 for r in receivers if r['status'] == 'ATTACHED')
+                    online = sum(1 for r in receivers if r['status'] == 'ONLINE')
+                    console.print(f"\n[blue]Summary:[/blue] {total_receivers} receivers total ({attached} attached, {online} online, {total_receivers - attached - online} other)")
+                    if online > 0:
+                        console.print(f"[yellow]Tip:[/yellow] {online} receiver(s) can be saved and deleted to free space")
+                else:
+                    console.print(f"[yellow]No receivers found for {library}.{journal}[/yellow]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("cleanup")
+@click.option("--journal", "-j", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--keep", "-k", default=2, help="Number of recent receivers to keep (default: 2)")
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted without executing")
+@click.option("--force", is_flag=True, help="Force delete by auto-answering the 'receiver not saved' inquiry (CPA7025). Prevents hanging in MSGW status.")
+@click.pass_context
+def journal_cleanup(ctx: click.Context, journal: str, library: str, keep: int, dry_run: bool, force: bool) -> None:
+    """Clean up old journal receivers (keeps attached + N recent)."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Get cleanup plan
+            plan = jrn.get_cleanup_plan(journal, library, keep)
+            
+            if not plan['to_delete']:
+                console.print(f"[green]No receivers to clean up for {library}.{journal}[/green]")
+                return
+            
+            # Show plan
+            console.print(f"\n[blue]Cleanup Plan for {library}.{journal}:[/blue]")
+            console.print(f"Keeping: {plan['keeping']} receiver(s)")
+            console.print(f"Deleting: {plan['deleting']} receiver(s)")
+            console.print(f"Space to free: {plan['space_mb']:.2f} MB\n")
+            
+            if plan['to_delete']:
+                rows = []
+                for r in plan['to_delete']:
+                    rows.append([r['receiver_name'], f"{r['entries']:,}", f"{r['size_mb']:.2f} MB"])
+                console.print(print_table(
+                    console,
+                    ["Receiver", "Entries", "Size"],
+                    rows,
+                    title="Receivers to Delete"
+                ))
+            
+            if dry_run:
+                console.print(f"\n[yellow]Dry run mode - no changes made[/yellow]")
+                console.print(f"Run without --dry-run to execute cleanup")
+            else:
+                if force:
+                    console.print(f"\n[yellow]Force mode: auto-answering 'receiver not saved' inquiry (CPA7025)[/yellow]")
+                console.print(f"\n[yellow]Executing cleanup...[/yellow]")
+                results = jrn.execute_cleanup(plan, force=force)
+                
+                success = sum(1 for r in results if r['success'])
+                failed = len(results) - success
+                
+                console.print(f"[green]Cleanup complete:[/green] {success} deleted, {failed} failed")
+                
+                if failed > 0:
+                    for r in results:
+                        if not r['success']:
+                            console.print(f"[red]Failed:[/red] {r['receiver_name']} - {r['error']}")
+
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("monitor")
+@click.option("--library", "-l", help="Monitor specific library")
+@click.option("--threshold", "-t", default=1000000, help="Entry count threshold for warning (default: 1M)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_monitor(ctx: click.Context, library: str | None, threshold: int, output_format: str) -> None:
+    """Monitor journal sizes and alert on large journals."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            journals = jrn.list_journals(library)
+            
+            alerts = []
+            rows = []
+            
+            for j in journals:
+                entries = j.get('total_entries', 0) or 0
+                
+                if entries > threshold * 5:
+                    status = "[red]CRITICAL[/red]"
+                    alerts.append(f"{j['journal_library']}.{j['journal_name']}: {entries:,} entries")
+                elif entries > threshold:
+                    status = "[yellow]WARNING[/yellow]"
+                    alerts.append(f"{j['journal_library']}.{j['journal_name']}: {entries:,} entries")
+                else:
+                    status = "[green]OK[/green]"
+                
+                rows.append([
+                    f"{j['journal_library']}.{j['journal_name']}",
+                    f"{entries:,}",
+                    str(j.get('receiver_count', 0)),
+                    status
+                ])
+            
+            if output_format == "json":
+                print_json_clean({
+                    'journals': journals,
+                    'alerts': alerts,
+                    'threshold': threshold
+                })
+            else:
+                console.print(print_table(
+                    console,
+                    ["Journal", "Entries", "Receivers", "Status"],
+                    rows,
+                    title=f"Journal Monitor (Threshold: {threshold:,} entries)"
+                ))
+                
+                if alerts:
+                    console.print(f"\n[yellow]⚠️  Alerts ({len(alerts)}):[/yellow]")
+                    for alert in alerts:
+                        console.print(f"  • {alert}")
+                    console.print(f"\n[blue]Recommendation:[/blue] Use 'journal cleanup' or 'journal receivers' to manage large journals")
+                else:
+                    console.print(f"\n[green]✓ All journals within threshold[/green]")
+    
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("info")
+@click.option("--table", "-t", required=True, help="Table name (supports wildcards: * or %)")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--fast", "-f", is_flag=True, help="Skip slow entry range query (for large journals)")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_info(ctx: click.Context, table: str, library: str, fast: bool, output_format: str) -> None:
+    """Get detailed journal information for one or more tables.
+    
+    Supports wildcards:
+      - * or % for multiple characters
+      - ? for single character
+    
+    Examples:
+      qadmcli journal info -t TB_01 -l EZPIPE
+      qadmcli journal info -t "TB_*" -l EZPIPE --fast
+      qadmcli journal info -t "TEST*" -l MYLIB
+    """
+    config_path = ctx.obj["config_path"]
+    
+    # Suppress logging for JSON output
+    if output_format == "json":
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Check if wildcard pattern (* and ? are shell-style, % is SQL-style)
+            if '*' in table or '%' in table or '?' in table:
+                # Find matching tables
+                from ..db.schema import SchemaManager
+                import fnmatch
+                schema_mgr = SchemaManager(conn)
+                all_tables = schema_mgr.list_tables(library)
+                
+                # Filter tables by pattern
+                pattern = table.replace('%', '*')
+                tables = [t for t in all_tables if fnmatch.fnmatch(t.name, pattern)]
+                
+                if not tables:
+                    console.print(f"[yellow]No tables matching pattern '{table}' in {library}[/yellow]")
+                    return
+                
+                # Process each table
+                results = []
+                console.print(f"[blue]Journal info for {len(tables)} table(s):[/blue]\n")
+                
+                # Temporarily suppress INFO logging for cleaner batch output
+                import logging
+                original_level = logging.getLogger("qadmcli").level
+                logging.getLogger("qadmcli").setLevel(logging.WARNING)
+                
+                try:
+                    for table in tables:
+                        try:
+                            info = jrn.get_journal_info(table.name, library, skip_entry_range=fast)
+                            results.append({
+                                "table": f"{library}.{table.name}",
+                                "info": info.model_dump()
+                            })
+                            
+                            # Format journal images for display
+                            images_display = info.journal_images or "N/A"
+                            if images_display == "*BOTH":
+                                images_display = "BOTH"
+                            elif images_display == "*AFTER":
+                                images_display = "AFTER"
+                            elif images_display == "*BEFORE":
+                                images_display = "BEFORE"
+                            
+                            # Compact display for batch mode
+                            status = "Journaled" if info.is_journaled else "Not Journaled"
+                            journal_info = f"{info.journal_library}.{info.journal_name}" if info.journal_library else "N/A"
+                            console.print(f"  {library}.{table.name}: {status} | {images_display} | {journal_info}")
+                            
+                        except Exception as e:
+                            results.append({
+                                "table": f"{library}.{table.name}",
+                                "error": str(e)
+                            })
+                            console.print(f"  [red]ERR[/red] {library}.{table.name}: {e}")
+                finally:
+                    # Restore original logging level
+                    logging.getLogger("qadmcli").setLevel(original_level)
+                
+                if output_format == "json":
+                    print_json_clean({
+                        "pattern": table,
+                        "library": library,
+                        "tables": results
+                    })
+            else:
+                # Single table
+                info = jrn.get_journal_info(table, library, skip_entry_range=fast)
+                
+                if output_format == "json":
+                    print_json_clean(info.model_dump())
+                else:
+                    # Format journal images for display
+                    images_display = info.journal_images or "N/A"
+                    if images_display == "*BOTH":
+                        images_display = "BOTH (Before & After)"
+                    elif images_display == "*AFTER":
+                        images_display = "AFTER (After image only)"
+                    elif images_display == "*BEFORE":
+                        images_display = "BEFORE (Before image only)"
+                    
+                    content = Text.assemble(
+                        ("Table: ", "bold"), f"{library}.{table}", "\n\n",
+                        ("Journal Status:\n", "bold underline"),
+                        ("  Journaled: ", "bold"), ("Yes" if info.is_journaled else "No"), "\n",
+                        ("  Journal: ", "bold"), (f"{info.journal_library}.{info.journal_name}" if info.journal_library else "N/A"), "\n",
+                        ("  Write Mode: ", "bold"), images_display, "\n",
+                        ("  Receiver: ", "bold"), (f"{info.journal_receiver_library}.{info.journal_receiver_name}" if info.journal_receiver_library else "N/A"), "\n",
+                        ("  Receiver Attached: ", "bold"), str(info.receiver_attach_timestamp or "N/A"), "\n",
+                        ("  Receiver Detached: ", "bold"), str(info.receiver_detach_timestamp or "Still attached"), "\n\n",
+                        ("Table Entry Range:\n", "bold underline"),
+                        ("  Oldest Sequence: ", "bold"), str(info.oldest_entry_sequence or "N/A"), "\n",
+                        ("  Newest Sequence: ", "bold"), str(info.newest_entry_sequence or "N/A"), "\n",
+                        ("  Oldest Time: ", "bold"), str(info.oldest_entry_timestamp or "N/A"), "\n",
+                        ("  Newest Time: ", "bold"), str(info.newest_entry_timestamp or "N/A"), "\n",
+                        ("  Total Entries: ", "bold"), str(info.total_entries or "N/A"),
+                    )
+                    print_panel(ctx, content, title="Detailed Journal Information", border_style="blue")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("last-txn")
+@click.option("--table", "-t", "tables", required=True, multiple=True,
+              help="Table in Library.Table format (can be specified multiple times)")
+@click.option("--format", "-f", "output_format", type=click.Choice(["table", "json"]),
+              default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_last_txn(ctx: click.Context, tables: tuple[str], output_format: str) -> None:
+    """Get last transaction sequence and timestamp for table(s).
+
+    Queries the attached journal receiver for LAST_SEQUENCE_NUMBER
+    and converts the attach timestamp to .NET ticks, providing both
+    TransactionID (sequence) and TransactionTS (ticks) as used by
+    Syniti Replicate metadata.
+
+    Examples:
+
+      qadmcli journal last-txn -t SYNITI.CHDRPF50
+
+      qadmcli journal last-txn -t SYNITI.CHDRPF50 -t SYNITI.DEMOTABLETEST_2
+
+      qadmcli journal last-txn -t SYNITI.CHDRPF50 -f json
+    """
+    config_path = ctx.obj["config_path"]
+
+    if output_format == "json":
+        import logging
+        logging.getLogger("qadmcli").setLevel(logging.WARNING)
+
+    try:
+        config = load_config(config_path)
+
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            results = jrn.get_last_transaction(list(tables))
+
+            if output_format == "json":
+                print_json_clean(results)
+            else:
+                rows = []
+                for r in results:
+                    if "error" in r:
+                        rows.append([
+                            r.get("table", "?"),
+                            "[red]ERROR[/red]",
+                            r.get("error", "Unknown error"),
+                            "—", "—", "—"
+                        ])
+                    else:
+                        rows.append([
+                            r["table"],
+                            r["journal"],
+                            str(r["last_sequence"]),
+                            r.get("attach_timestamp") or "—",
+                            str(r.get("transaction_ts") or "—"),
+                            r.get("transaction_ts_datetime") or "—"
+                        ])
+
+                console.print(print_table(
+                    console,
+                    ["Table", "Journal", "Last Seq", "Attach Time", "TransactionTS", "Datetime"],
+                    rows,
+                    title="Last Transaction Info"
+                ))
+
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("create-receiver")
+@click.option("--name", "-n", required=True, help="Journal receiver name")
+@click.option("--library", "-l", required=True, help="Library for journal receiver")
+@click.option("--threshold", "-t", default="*NONE", help="Size threshold (e.g., '100000' or '*NONE')")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_create_receiver(
+    ctx: click.Context,
+    name: str,
+    library: str,
+    threshold: str,
+    output_format: str
+) -> None:
+    """Create a standalone journal receiver (not attached to any journal)."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            result = jrn.create_journal_receiver(name, library, threshold)
+            
+            console.print(f"[green]Created journal receiver {library}.{name}[/green]")
+            console.print("[yellow]Note: Receiver is not attached to any journal.[/yellow]")
+            console.print("Use 'journal rollover' to attach it to a journal.")
+            if threshold != "*NONE":
+                console.print(f"Threshold: {threshold} KB")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("rollover")
+@click.option("--journal", "-j", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library name")
+@click.option("--receiver", "-r", help="New receiver name (auto-generated if not specified)")
+@click.option("--receiver-library", "-rl", help="Library for new receiver (defaults to journal library)")
+@click.pass_context
+def journal_rollover(
+    ctx: click.Context,
+    journal: str,
+    library: str,
+    receiver: str | None,
+    receiver_library: str | None
+) -> None:
+    """Rollover journal to a new receiver (detaches current, attaches new).
+    
+    This creates a new receiver and attaches it to the journal, automatically
+    detaching the current receiver. The detached receiver becomes ONLINE status
+    and can be cleaned up later.
+    """
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            
+            # Get current receiver before rollover
+            old_receivers = jrn.get_receiver_chain(journal, library)
+            old_attached = [r for r in old_receivers if r['status'] == 'ATTACHED']
+            old_name = old_attached[0]['receiver_name'] if old_attached else 'Unknown'
+            
+            # Perform rollover
+            result = jrn.rollover_journal(journal, library, receiver, receiver_library)
+            
+            console.print(f"[green]Journal rollover complete:[/green] {library}.{journal}")
+            console.print(f"  Old receiver: {old_name} (now ONLINE)")
+            console.print(f"  New receiver: {result['new_receiver']} (now ATTACHED)")
+            console.print(f"\n[blue]Tip:[/blue] Use 'journal receivers -j {journal} -l {library}' to view the chain")
+            console.print(f"      Use 'journal cleanup -j {journal} -l {library}' to remove old receivers")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@journal.command("create")
+@click.option("--name", "-n", required=True, help="Journal name")
+@click.option("--library", "-l", required=True, help="Library for journal")
+@click.option("--receiver", "-r", required=True, help="Journal receiver name")
+@click.option("--receiver-library", "-rl", help="Journal receiver library (defaults to journal library)")
+@click.option("--msg-queue", "-m", default="*NONE", help="Message queue for journal messages")
+@click.option("--format", "-F", "output_format", type=click.Choice(["table", "json"]), default="table", help="Output format (default: table)")
+@click.pass_context
+def journal_create(
+    ctx: click.Context,
+    name: str,
+    library: str,
+    receiver: str,
+    receiver_library: str | None,
+    msg_queue: str,
+    output_format: str
+) -> None:
+    """Create a journal."""
+    config_path = ctx.obj["config_path"]
+    
+    try:
+        config = load_config(config_path)
+        
+        with AS400ConnectionManager(config) as conn:
+            jrn = JournalManager(conn)
+            result = jrn.create_journal(name, library, receiver, receiver_library, msg_queue)
+            
+            recv_lib = receiver_library or library
+            console.print(f"[green]Created journal {library}.{name}[/green]")
+            console.print(f"Attached to receiver: {recv_lib}.{receiver}")
+        
+    except ConnectionError as e:
+        console.print(f"[red]Connection error: {e.message}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+
+
+def register_journal_commands(cli_group):
+    """Register journal commands with the main CLI group."""
+    cli_group.add_command(journal)
