@@ -1,6 +1,18 @@
 version: '3.8'
 
 services:
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    network_mode: host
+    command:
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--entrypoints.web.address=:80"
+      - "--api.insecure=true"
+    volumes:
+      - ./traefik:/etc/traefik/dynamic:ro
+    restart: unless-stopped
+
   gs-vercount:
     image: localhost/gs-vercount:latest
     container_name: gs-vercount

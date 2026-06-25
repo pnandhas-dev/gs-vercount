@@ -1,0 +1,21 @@
+http:
+  routers:
+    gs-vercount-router:
+      rule: "PathPrefix(`/vercount`)"
+      service: gs-vercount-service
+      entryPoints:
+        - web
+      middlewares:
+        - vercount-stripprefix
+
+  middlewares:
+    vercount-stripprefix:
+      stripPrefix:
+        prefixes:
+          - "/vercount"
+
+  services:
+    gs-vercount-service:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8083"
