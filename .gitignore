@@ -1,6 +1,6 @@
 # Local env configuration
 .env
-
+*.txt
 # Python compilation/cache
 __pycache__/
 *.pyc
