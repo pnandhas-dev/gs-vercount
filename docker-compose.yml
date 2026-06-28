@@ -7,8 +7,7 @@ services:
     network_mode: host
     command:
       - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--entrypoints.web.address=:80"
-      - "--api.insecure=true"
+      - "--entrypoints.web.address=:8085"
     volumes:
       - ./traefik:/etc/traefik/dynamic:ro
     restart: unless-stopped

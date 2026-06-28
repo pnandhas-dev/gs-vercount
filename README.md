@@ -34,6 +34,12 @@ MSSQL_HOST=your_mssql_host
 MSSQL_DATABASE=your_mssql_db
 MSSQL_USER=your_mssql_user
 MSSQL_PASSWORD=your_mssql_password
+
+# External URL for emails & reports (defaults to http://{HOST_IP}:8083)
+# To access directly using host's LAN IP:
+APP_EXTERNAL_URL=http://{HOST_IP}:8083
+# Or when running behind the Traefik reverse proxy:
+# APP_EXTERNAL_URL=http://{HOST_IP}:8085/vercount
 ```
 
 ### Build & Deploy

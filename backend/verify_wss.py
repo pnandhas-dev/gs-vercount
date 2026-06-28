@@ -26,6 +26,7 @@ try:
         store_metrics,
         store_entity_status,
         store_agent_health,
+        APP_EXTERNAL_URL,
     )
 except ModuleNotFoundError:
     from shared import (
@@ -41,6 +42,7 @@ except ModuleNotFoundError:
         store_metrics,
         store_entity_status,
         store_agent_health,
+        APP_EXTERNAL_URL,
     )
 
 from replica_msdk import GlueSyncWebSocketClient, parse_protobuf
@@ -1206,7 +1208,7 @@ def execute_scheduler_job(job: dict, log_path: str):
                 <li><strong>Errors:</strong> {error_count}</li>
             </ul>
             <p style="margin: 20px 0;">
-               <a href="http://localhost:8083{report_url}" style="display:inline-block; padding: 10px 20px; background-color: #3b82f6; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">
+               <a href="{APP_EXTERNAL_URL}{report_url}" style="display:inline-block; padding: 10px 20px; background-color: #3b82f6; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">
                   Open Full Report ↗
                </a>
             </p>
@@ -1223,7 +1225,7 @@ def execute_scheduler_job(job: dict, log_path: str):
             mail_log_path = os.path.join(mail_log_dir, "mail.log")
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             with open(mail_log_path, 'a', encoding='utf-8') as mf:
-                mf.write(f"[{now_str}] EMAIL \"Please find daily report in http://192.168.13.53:8083{report_url}\"\n")
+                mf.write(f"[{now_str}] EMAIL \"Please find daily report in {APP_EXTERNAL_URL}{report_url}\"\n")
         except Exception as ex:
             print(f"[scheduler] Error writing mail.log: {ex}", flush=True)
     except Exception as e:
